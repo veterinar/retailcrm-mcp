@@ -4,7 +4,7 @@
       "command": "npx",
       "args": ["-y", "@theyahia/retailcrm-mcp"],
       "env": {
-        "RETAILCRM_URL": "",
+        "RETAILCRM_DOMAIN": "",
         "RETAILCRM_API_KEY": ""
       }
     }
