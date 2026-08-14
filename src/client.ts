@@ -105,7 +105,7 @@ async function rateGate(): Promise<void> {
 // ── PHP bridge (official retailcrm/api-client-php 6.15.32) ───
 type BridgeOp = "get" | "post" | "post_raw";
 
-interface BridgeRequest {
+export interface BridgeRequest {
   v: number;
   op: BridgeOp;
   path: string;
@@ -114,13 +114,67 @@ interface BridgeRequest {
   content_type?: string;
 }
 
-interface BridgeResponse {
+export interface BridgeResponse {
   v?: number;
   ok?: boolean;
   status?: number;
   data?: unknown;
   body?: string;
   error?: string;
+}
+
+/**
+ * Test-only injection seam for the PHP bridge. Vitest sets VITEST in the worker
+ * environment; anywhere else installation is refused, so production always
+ * spawns the real bridge process. Handlers receive the exact bridge request and
+ * must return a protocol-conformant response (validated fail-closed below) or
+ * throw — e.g. a RetailCrmHttpError to simulate HTTP failures/timeouts.
+ */
+export type BridgeHandler = (request: BridgeRequest) => BridgeResponse | Promise<BridgeResponse>;
+
+let testBridgeHandler: BridgeHandler | null = null;
+
+export function __setTestBridge(handler: BridgeHandler | null): void {
+  if (!process.env.VITEST) {
+    throw new Error("RetailCRM bridge test injection is refused outside Vitest");
+  }
+  testBridgeHandler = handler;
+}
+
+/**
+ * Fail fast when required credentials are absent — before any bridge spawn.
+ * Mirrors the env checks the PHP bridge performs, so misconfiguration surfaces
+ * deterministically regardless of host PHP availability.
+ */
+function ensureBridgeEnv(): void {
+  if (!process.env.RETAILCRM_API_KEY) throw new Error("RETAILCRM_API_KEY is not set. Create one in RetailCRM > Settings > Integration > API keys");
+  if (!process.env.RETAILCRM_DOMAIN && !process.env.RETAILCRM_URL) throw new Error("RETAILCRM_DOMAIN is not set. Set it to your RetailCRM domain (e.g. yourstore.retailcrm.ru)");
+}
+
+/**
+ * Shared fail-closed validation of a bridge response object. Returns the
+ * response data on success; throws RetailCrmHttpError for {ok:false} responses
+ * and a plain Error for protocol violations. Used by both the child-process
+ * path and the test seam, so injected mocks cannot bypass protocol rules.
+ */
+function validateBridgeResponse(parsed: unknown, stderrNote: string): unknown {
+  if (
+    parsed === null || typeof parsed !== "object" ||
+    ((parsed as BridgeResponse).v !== BRIDGE_PROTOCOL_VERSION) ||
+    typeof (parsed as BridgeResponse).ok !== "boolean"
+  ) {
+    throw new Error(`RetailCRM bridge protocol violation${stderrNote}`);
+  }
+  const response = parsed as BridgeResponse;
+  if (!response.ok) {
+    const status = typeof response.status === "number" ? response.status : 0;
+    const body =
+      typeof response.body === "string"
+        ? response.body
+        : JSON.stringify({ success: false, errorMsg: response.error ?? "bridge error" });
+    throw new RetailCrmHttpError(formatApiError(status, body), { status, body });
+  }
+  return response.data;
 }
 
 /**
@@ -131,8 +185,14 @@ interface BridgeResponse {
  * (inherited by the child); they never appear in argv, the JSON payload, or logs.
  */
 function invokeBridge(request: BridgeRequest, idempotent: boolean): Promise<unknown> {
+  ensureBridgeEnv();
   return withRetry(async () => {
     await rateGate();
+    // Test-only seam: when installed (Vitest refuses installation elsewhere),
+    // exercise the same fail-closed protocol validation as the real process.
+    if (testBridgeHandler) {
+      return validateBridgeResponse(await testBridgeHandler(request), "");
+    }
     return await new Promise<unknown>((resolve, reject) => {
       const { php, script } = getBridgeCommand();
       const child = spawn(php, [script], { stdio: ["pipe", "pipe", "pipe"] });
@@ -194,30 +254,18 @@ function invokeBridge(request: BridgeRequest, idempotent: boolean): Promise<unkn
           finish(new Error(`RetailCRM bridge returned ${lines.length} output lines, expected exactly 1${stderrNote}`));
           return;
         }
-        let parsed: BridgeResponse;
+        let parsed: unknown;
         try {
           parsed = JSON.parse(lines[0]) as BridgeResponse;
         } catch {
           finish(new Error(`RetailCRM bridge returned malformed JSON${stderrNote}`));
           return;
         }
-        if (
-          parsed === null || typeof parsed !== "object" ||
-          parsed.v !== BRIDGE_PROTOCOL_VERSION || typeof parsed.ok !== "boolean"
-        ) {
-          finish(new Error(`RetailCRM bridge protocol violation${stderrNote}`));
-          return;
+        try {
+          finish(undefined, validateBridgeResponse(parsed, stderrNote));
+        } catch (err) {
+          finish(err);
         }
-        if (!parsed.ok) {
-          const status = typeof parsed.status === "number" ? parsed.status : 0;
-          const body =
-            typeof parsed.body === "string"
-              ? parsed.body
-              : JSON.stringify({ success: false, errorMsg: parsed.error ?? "bridge error" });
-          finish(new RetailCrmHttpError(formatApiError(status, body), { status, body }));
-          return;
-        }
-        finish(undefined, parsed.data);
       });
 
       // EPIPE is handled by the close event; ignore stdin write errors.

@@ -172,9 +172,17 @@ function requireAutoloader(): void {
  * GET / form POST through the official client using CustomMethods +
  * CustomApiMethod, with the route stripped of its leading slash and the flat
  * string parameters preserved exactly.
+ *
+ * RequestMethod is resolved here, AFTER the Composer autoloader is loaded —
+ * resolving it at the call site would fatal with class-not-found on the
+ * first request.
  */
-function officialRequest(string $method, string $route, array $params): array {
+function officialRequest(string $op, string $route, array $params): array {
     requireAutoloader();
+
+    $method = $op === 'get'
+        ? \RetailCrm\Api\Enum\RequestMethod::GET
+        : \RetailCrm\Api\Enum\RequestMethod::POST;
 
     $client = \RetailCrm\Api\Factory\SimpleClientFactory::createClient(apiOrigin(), apiKey());
     $client->customMethods->register(
@@ -292,14 +300,11 @@ function rawUpload(string $route, string $bodyBytes, string $contentType): array
             fail(0, 'query strings are not allowed for this operation; use params');
         }
         $params = normalizeParams($request['params'] ?? null);
-        $method = $op === 'get'
-            ? \RetailCrm\Api\Enum\RequestMethod::GET
-            : \RetailCrm\Api\Enum\RequestMethod::POST;
         respond([
             'v'      => PROTOCOL_VERSION,
             'ok'     => true,
             'status' => 200,
-            'data'   => officialRequest($method, $route, $params),
+            'data'   => officialRequest($op, $route, $params),
         ]);
     }
 
