@@ -1,21 +1,25 @@
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
 const TIMEOUT = 15_000;
 const MAX_RETRIES = 3;
+
+// Bridge protocol version. Node and the PHP bridge must agree on this; the
+// bridge refuses unknown versions (fail-closed), and so do we.
+const BRIDGE_PROTOCOL_VERSION = 1;
+const MAX_STDOUT_BYTES = 32 * 1024 * 1024;
+const MAX_STDERR_BYTES = 8 * 1024;
 
 // Optional client-side rate limiter (RetailCRM throttles bursts → HTTP 503).
 // Disabled unless RETAILCRM_RATE_LIMIT (requests/second) is set. v5 allows 10 req/s per IP.
 const RATE_LIMIT = Number(process.env.RETAILCRM_RATE_LIMIT) || 0;
 
-function getBaseUrl(): string {
-  const domain = process.env.RETAILCRM_DOMAIN || process.env.RETAILCRM_URL;
-  if (!domain) throw new Error("RETAILCRM_DOMAIN is not set. Set it to your RetailCRM domain (e.g. yourstore.retailcrm.ru)");
-  const base = domain.endsWith("/") ? domain.slice(0, -1) : domain;
-  return `https://${base.replace(/^https?:\/\//, "")}/api/v5`;
-}
-
-function getApiKey(): string {
-  const key = process.env.RETAILCRM_API_KEY;
-  if (!key) throw new Error("RETAILCRM_API_KEY is not set. Create one in RetailCRM > Settings > Integration > API keys");
-  return key;
+function getBridgeCommand(): { php: string; script: string } {
+  const php = process.env.RETAILCRM_PHP_BIN || "php";
+  const script =
+    process.env.RETAILCRM_PHP_BRIDGE ||
+    fileURLToPath(new URL("../bin/retailcrm-api.php", import.meta.url));
+  return { php, script };
 }
 
 /**
@@ -98,73 +102,162 @@ async function rateGate(): Promise<void> {
   if (wait > 0) await new Promise(r => setTimeout(r, wait));
 }
 
-function commonHeaders(extra?: Record<string, string>): Record<string, string> {
-  return {
-    Accept: "application/json",
-    "X-API-KEY": getApiKey(),
-    "User-Agent": "retailcrm-mcp",
-    ...extra,
-  };
+// ── PHP bridge (official retailcrm/api-client-php 6.15.32) ───
+type BridgeOp = "get" | "post" | "post_raw";
+
+interface BridgeRequest {
+  v: number;
+  op: BridgeOp;
+  path: string;
+  params?: Record<string, string>;
+  body_base64?: string;
+  content_type?: string;
+}
+
+interface BridgeResponse {
+  v?: number;
+  ok?: boolean;
+  status?: number;
+  data?: unknown;
+  body?: string;
+  error?: string;
 }
 
 /**
- * One HTTP attempt. The AbortController stays armed across the response-body read,
- * so a server that sends headers then stalls the body still hits the timeout.
+ * One bridge attempt. The whole call (spawn → response) is capped at TIMEOUT by
+ * SIGKILL-ing the PHP process, which preserves the previous 15-second whole-call
+ * timeout semantics. A malformed, empty, or non-JSON bridge response is ALWAYS an
+ * error — never a success. Credentials travel only via environment variables
+ * (inherited by the child); they never appear in argv, the JSON payload, or logs.
  */
-async function doFetch(url: string, init: RequestInit, idempotent: boolean): Promise<unknown> {
+function invokeBridge(request: BridgeRequest, idempotent: boolean): Promise<unknown> {
   return withRetry(async () => {
     await rateGate();
-    const controller = new AbortController();
-    let aborted = false;
-    const timer = setTimeout(() => { aborted = true; controller.abort(); }, TIMEOUT);
-    try {
-      const response = await fetch(url, { ...init, signal: controller.signal });
-      if (response.ok) {
-        const data = await response.json();
+    return await new Promise<unknown>((resolve, reject) => {
+      const { php, script } = getBridgeCommand();
+      const child = spawn(php, [script], { stdio: ["pipe", "pipe", "pipe"] });
+
+      let stdout = Buffer.alloc(0);
+      let stderr = "";
+      let overflowed = false;
+      let timedOut = false;
+      let settled = false;
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, TIMEOUT);
+
+      const finish = (err?: unknown, value?: unknown) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
-        return data;
-      }
-      const text = await response.text();
-      clearTimeout(timer);
-      throw new RetailCrmHttpError(formatApiError(response.status, text), { status: response.status, body: text });
-    } catch (error) {
-      clearTimeout(timer);
-      if (aborted || (error instanceof Error && error.name === "AbortError")) {
-        throw new RetailCrmHttpError(`RetailCRM request timed out after ${TIMEOUT}ms`, { isTimeout: true });
-      }
-      throw error;
-    }
+        if (err) reject(err);
+        else resolve(value);
+      };
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (stdout.length + chunk.length > MAX_STDOUT_BYTES) {
+          overflowed = true;
+          child.kill("SIGKILL");
+          return;
+        }
+        stdout = Buffer.concat([stdout, chunk]);
+      });
+
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr = (stderr + chunk.toString("utf8")).slice(0, MAX_STDERR_BYTES);
+      });
+
+      child.on("error", (err: Error) => {
+        finish(new Error(`RetailCRM bridge failed to start: ${err.message}`));
+      });
+
+      child.on("close", (code: number | null) => {
+        if (timedOut) {
+          finish(new RetailCrmHttpError(`RetailCRM request timed out after ${TIMEOUT}ms`, { isTimeout: true }));
+          return;
+        }
+        const text = stdout.toString("utf8").trim();
+        // Never surface the API key, even if the bridge leaked it to stderr.
+        const apiKey = process.env.RETAILCRM_API_KEY ?? "";
+        const safeStderr = apiKey ? stderr.trim().split(apiKey).join("[redacted]") : stderr.trim();
+        const stderrNote = safeStderr ? ` (bridge stderr: ${safeStderr.slice(0, 256)})` : "";
+        if (overflowed || code !== 0 || text === "") {
+          finish(new Error(`RetailCRM bridge failed (exit ${code ?? "unknown"})${stderrNote}`));
+          return;
+        }
+        // The bridge must emit exactly one JSON line. Multiple non-empty lines
+        // mean unexpected output interleaved with the response — reject.
+        const lines = text.split("\n").filter(l => l.trim() !== "");
+        if (lines.length !== 1) {
+          finish(new Error(`RetailCRM bridge returned ${lines.length} output lines, expected exactly 1${stderrNote}`));
+          return;
+        }
+        let parsed: BridgeResponse;
+        try {
+          parsed = JSON.parse(lines[0]) as BridgeResponse;
+        } catch {
+          finish(new Error(`RetailCRM bridge returned malformed JSON${stderrNote}`));
+          return;
+        }
+        if (
+          parsed === null || typeof parsed !== "object" ||
+          parsed.v !== BRIDGE_PROTOCOL_VERSION || typeof parsed.ok !== "boolean"
+        ) {
+          finish(new Error(`RetailCRM bridge protocol violation${stderrNote}`));
+          return;
+        }
+        if (!parsed.ok) {
+          const status = typeof parsed.status === "number" ? parsed.status : 0;
+          const body =
+            typeof parsed.body === "string"
+              ? parsed.body
+              : JSON.stringify({ success: false, errorMsg: parsed.error ?? "bridge error" });
+          finish(new RetailCrmHttpError(formatApiError(status, body), { status, body }));
+          return;
+        }
+        finish(undefined, parsed.data);
+      });
+
+      // EPIPE is handled by the close event; ignore stdin write errors.
+      child.stdin.on("error", () => {});
+      child.stdin.write(`${JSON.stringify(request)}\n`);
+      child.stdin.end();
+    });
   }, idempotent);
 }
 
 export async function retailCrmGet(path: string, params?: Record<string, string>): Promise<unknown> {
-  const qs = new URLSearchParams(params).toString();
-  const url = qs ? `${getBaseUrl()}${path}?${qs}` : `${getBaseUrl()}${path}`;
-  return doFetch(url, { headers: commonHeaders() }, true);
+  return invokeBridge({ v: BRIDGE_PROTOCOL_VERSION, op: "get", path, params }, true);
 }
 
 export async function retailCrmPost(path: string, formData: Record<string, string>): Promise<unknown> {
-  const body = new URLSearchParams(formData).toString();
-  return doFetch(`${getBaseUrl()}${path}`, {
-    method: "POST",
-    headers: commonHeaders({ "Content-Type": "application/x-www-form-urlencoded" }),
-    body,
-  }, false); // mutation: do not retry on timeout/5xx (may have committed)
+  // mutation: do not retry on timeout/5xx (may have committed)
+  return invokeBridge({ v: BRIDGE_PROTOCOL_VERSION, op: "post", path, params: formData }, false);
 }
 
 /**
  * Raw-body POST for endpoints that take the payload directly (e.g. /files/upload,
  * which expects the file bytes under Content-Type: application/octet-stream — NOT
- * multipart/form-data).
+ * multipart/form-data). Documented compatibility exception: the official client's
+ * FilesUploadRequest does not preserve the filename query parameter and caller
+ * MIME type, so the bridge executes this op with PHP cURL directly.
  */
 export async function retailCrmPostRaw(
   path: string,
   body: Uint8Array | string,
   contentType = "application/octet-stream",
 ): Promise<unknown> {
-  return doFetch(`${getBaseUrl()}${path}`, {
-    method: "POST",
-    headers: commonHeaders({ "Content-Type": contentType }),
-    body: body as BodyInit,
-  }, false);
+  const bytes = typeof body === "string" ? Buffer.from(body, "utf8") : Buffer.from(body);
+  return invokeBridge(
+    {
+      v: BRIDGE_PROTOCOL_VERSION,
+      op: "post_raw",
+      path,
+      body_base64: bytes.toString("base64"),
+      content_type: contentType,
+    },
+    false,
+  );
 }

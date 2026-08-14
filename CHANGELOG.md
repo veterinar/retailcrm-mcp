@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] — 2026-08-14
+
+Transport refactor: the RetailCRM API calls now run through the official
+`retailcrm/api-client-php` client, pinned exactly to **6.15.32**, invoked from
+Node via a PHP bridge. No MCP-facing behavior changed.
+
+### Changed
+- **Official PHP client transport.** `retailCrmGet` / `retailCrmPost` in
+  `src/client.ts` now delegate to `bin/retailcrm-api.php`, which uses
+  `SimpleClientFactory::createClient` (bare origin, no `/api/v5` suffix) with
+  `CustomMethods` + `CustomApiMethod` + `RequestMethod` — route stripped of its
+  leading slash, flat string parameters preserved exactly. The `X-API-KEY`
+  header, shaped output, readonly filtering, rate gate, retry policy
+  (3 attempts; 429 always; timeout/5xx GET-only; no ambiguous POST retry),
+  `RetailCrmHttpError`, and `formatApiError` exports are unchanged.
+- **15-second whole-call timeout preserved** in Node by SIGKILL-ing the bridge
+  process; timeouts still surface as `isTimeout` errors for the GET-only retry.
+- **Versioned, fail-closed bridge protocol (v1).** JSON over stdin/stdout;
+  method/path/domain validation; absolute URLs, traversal, CR/LF, and
+  unsupported operations rejected; bounded stderr capture; malformed/empty/
+  non-JSON bridge output is always an error, never success. Credentials stay in
+  environment variables — never argv, payloads, logs, or errors.
+- Package renamed to `retailcrm-mcp` and marked private; version 3.1.0.
+
+### Added
+- **Self-contained Docker image** (multi-stage `Dockerfile` on pinned
+  major/minor official images): Node build stage, Composer production stage
+  (plugins and scripts disabled), and a non-root Node + PHP CLI/cURL runtime
+  with only the required artifacts. stdio remains the default entrypoint;
+  `--http` args are accepted.
+- `composer.json` requiring `retailcrm/api-client-php` exactly `6.15.32` with a
+  production-safe configuration (no plugins, no scripts).
+- README rewritten for the Docker-first workflow plus an optional local
+  Node + PHP + Composer path; upstream MIT attribution preserved.
+
+### Documented compatibility exception
+- **`files_upload`** keeps its raw-bytes + `?filename=` behavior because the
+  official v6.15.32 `FilesUploadRequest` does not preserve the filename query
+  parameter and caller MIME type. It executes inside the PHP bridge with PHP
+  cURL — same normalized RetailCRM origin, API key header, 15-second timeout,
+  bounded error handling, no credential logging. All other tool traffic uses
+  the official client.
+
+### Removed
+- `smithery.yaml` (it would have started the unrefactored upstream npm
+  package); `.mcp.json` now points at the local Docker command without
+  embedding credentials.
+
 ## [3.0.0] — 2026-06-23
 
 Production-hardening release. **Breaking**: read tools now return shaped, token-efficient

@@ -1,0 +1,23 @@
+{
+  "name": "retailcrm/mcp-php-bridge",
+  "description": "PHP bridge dependencies for the retailcrm-mcp MCP server (official RetailCRM API client transport)",
+  "type": "project",
+  "license": "MIT",
+  "config": {
+    "optimize-autoloader": true,
+    "sort-packages": true,
+    "allow-plugins": {},
+    "platform": {
+      "php": "8.2.0"
+    }
+  },
+  "prefer-stable": true,
+  "require": {
+    "php": ">=8.1",
+    "ext-curl": "*",
+    "ext-json": "*",
+    "ext-mbstring": "*",
+    "ext-openssl": "*",
+    "retailcrm/api-client-php": "6.15.32"
+  }
+}

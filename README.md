@@ -1,9 +1,10 @@
-# @theyahia/retailcrm-mcp
+# retailcrm-mcp
 
-Production-grade MCP server for **RetailCRM** e-commerce CRM. 39 tools + 2 prompt skills for managing orders, customers, products, inventory, payments, tasks, references, and analytics via API v5.
+Production-grade MCP server for **RetailCRM** e-commerce CRM. **39 tools** + 2 prompt skills for managing orders, customers, products, inventory, payments, tasks, references, and analytics via API v5.
 
-[![npm](https://img.shields.io/npm/v/@theyahia/retailcrm-mcp)](https://www.npmjs.com/package/@theyahia/retailcrm-mcp)
-[![Smithery](https://smithery.ai/badge/@theyahia/retailcrm-mcp)](https://smithery.ai/server/@theyahia/retailcrm-mcp)
+API traffic is transported by the official [`retailcrm/api-client-php`](https://github.com/retailcrm/api-client-php) client, pinned to **6.15.32**, invoked from Node through a PHP bridge (`bin/retailcrm-api.php`). The server ships as a self-contained Docker image — no host PHP or Composer required.
+
+Forked from [theYahia/retailcrm-mcp](https://github.com/theYahia/retailcrm-mcp) (MIT).
 
 ## Output is token-efficient by default
 
@@ -15,7 +16,7 @@ Read tools return a **compact, shaped summary** of only the fields an agent need
 | `detail:"full"` | All shaped fields (line items, delivery, payments, address…) |
 | `raw:true` | The untouched RetailCRM response (for debugging) |
 
-> ⚠️ **v3 is a breaking change** vs v2: default output is now the shaped summary instead of raw JSON. Pass `raw:true` to restore the old payload.
+> ⚠️ **v3 was a breaking change** vs v2: default output is the shaped summary instead of raw JSON. Pass `raw:true` to restore the old payload.
 
 ## Tools (39)
 
@@ -97,26 +98,62 @@ Read tools return a **compact, shaped summary** of only the fields an agent need
 
 ## Environment Variables
 
+Secrets are provided via environment variables only — never on the command line, in config files, or in logs.
+
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `RETAILCRM_DOMAIN` | Yes | Your RetailCRM domain (e.g. `yourstore.retailcrm.ru`) |
-| `RETAILCRM_API_KEY` | Yes | API key (sent via the `X-API-KEY` header) |
+| `RETAILCRM_API_KEY` | Yes | API key (sent via the `X-API-KEY` header by the PHP client) |
 | `RETAILCRM_READONLY` | No | `1` to expose only read tools (hide create/update/merge/delete) |
 | `RETAILCRM_RATE_LIMIT` | No | Client-side requests/second cap (RetailCRM allows ~10/s) |
+| `RETAILCRM_PHP_BIN` | No | PHP executable for the local (non-Docker) path (default `php`) |
+| `RETAILCRM_PHP_BRIDGE` | No | Path to `bin/retailcrm-api.php` (set automatically in Docker) |
 | `PORT` / `HOST` | No | HTTP server bind (default `3000` / `127.0.0.1`, `--http` mode only) |
 | `RETAILCRM_HTTP_ALLOWED_HOSTS` | No | Comma-separated allowed `Host` values for DNS-rebinding protection |
 | `RETAILCRM_DNS_PROTECTION` | No | `off` to disable DNS-rebinding protection (HTTP mode) |
 
 > `RETAILCRM_URL` is still accepted as a fallback for `RETAILCRM_DOMAIN`.
 
-## Usage with Claude Desktop
+## Docker (recommended)
+
+Build the self-contained image (Node + PHP CLI/cURL + compiled server + PHP bridge + Composer production dependencies — official `retailcrm/api-client-php` **6.15.32**):
+
+```bash
+docker build -t retailcrm-mcp:3.1.0 .
+```
+
+Run over stdio:
+
+```bash
+docker run --rm -i \
+  -e RETAILCRM_DOMAIN=yourstore.retailcrm.ru \
+  -e RETAILCRM_API_KEY=your-api-key \
+  retailcrm-mcp:3.1.0
+```
+
+Run the Streamable HTTP server instead by appending `--http`:
+
+```bash
+docker run --rm -p 127.0.0.1:3000:3000 \
+  -e RETAILCRM_DOMAIN=yourstore.retailcrm.ru \
+  -e RETAILCRM_API_KEY=your-api-key \
+  -e HOST=0.0.0.0 \
+  retailcrm-mcp:3.1.0 --http
+```
+
+### Usage with Claude Desktop / MCP clients
 
 ```json
 {
   "mcpServers": {
     "retailcrm": {
-      "command": "npx",
-      "args": ["-y", "@theyahia/retailcrm-mcp"],
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i", "--init",
+        "-e", "RETAILCRM_DOMAIN",
+        "-e", "RETAILCRM_API_KEY",
+        "retailcrm-mcp:3.1.0"
+      ],
       "env": {
         "RETAILCRM_DOMAIN": "yourstore.retailcrm.ru",
         "RETAILCRM_API_KEY": "your-api-key"
@@ -126,26 +163,46 @@ Read tools return a **compact, shaped summary** of only the fields an agent need
 }
 ```
 
-## Streamable HTTP Mode
+## Optional: local Node + PHP + Composer
 
-Run as an HTTP server instead of stdio:
+If you prefer not to use Docker, run the same stack locally:
 
 ```bash
+# 1. Node dependencies + compile
+npm install
+npm run build
+
+# 2. PHP dependencies (Composer >= 2; plugins and scripts disabled)
+composer install --no-dev --no-interaction --no-progress --no-scripts --no-plugins --optimize-autoloader
+
+# 3. Run (stdio)
 RETAILCRM_DOMAIN=yourstore.retailcrm.ru \
-RETAILCRM_API_KEY=your-key \
-npx @theyahia/retailcrm-mcp --http
+RETAILCRM_API_KEY=your-api-key \
+node dist/index.js
+
+# Or the HTTP server
+RETAILCRM_DOMAIN=yourstore.retailcrm.ru \
+RETAILCRM_API_KEY=your-api-key \
+node dist/index.js --http
 ```
 
-- `POST /mcp` — MCP Streamable HTTP endpoint (stateless: a fresh server is created per request)
-- `GET /health` — health check (JSON with version, tool count)
-- `GET`/`DELETE /mcp` — `405` (not used in stateless mode)
-- Default bind: `127.0.0.1:3000`. DNS-rebinding protection is on by default for local binds.
+Requires Node >= 18 and PHP >= 8.1 with the cURL, JSON, mbstring, and openssl extensions.
 
-## Smithery
+## Architecture & the raw-upload exception
 
-```bash
-npx @smithery/cli install @theyahia/retailcrm-mcp
-```
+- All normal RetailCRM traffic (GET and form POST) goes through the official
+  `retailcrm/api-client-php` **6.15.32** client (`SimpleClientFactory::createClient` +
+  `CustomMethods`/`CustomApiMethod`), executed inside `bin/retailcrm-api.php`.
+- The Node client (`src/client.ts`) talks to the bridge over JSON on stdin/stdout
+  with a versioned, fail-closed protocol: malformed, empty, or non-JSON bridge
+  output is always an error, never success.
+- **`files_upload` is the one documented compatibility exception.** The official
+  v6.15.32 `FilesUploadRequest` does not preserve this MCP's `?filename=` query
+  parameter and caller MIME type, so the bridge performs that single call with
+  PHP cURL — same normalized origin, `X-API-KEY` header, 15-second timeout, and
+  bounded error handling. Every other tool uses the official client.
+- Retry policy is unchanged: 3 attempts, `429` always retried, timeout/5xx retried
+  for GETs only (never for ambiguous POSTs), optional client-side rate gate.
 
 ## Demo Prompts
 
@@ -163,7 +220,7 @@ RetailCRM does not support API-created webhooks. Use **Triggers** in the admin p
 
 - **Rate limits / 5xx:** automatic retry with exponential backoff + jitter (up to 3 attempts).
 - **API errors:** RetailCRM error details are parsed and returned to the model as a tool result with `isError: true`, so the agent can self-correct (e.g. retry with `by:"externalId"`).
-- **Timeouts:** 15-second per-request timeout with retry.
+- **Timeouts:** 15-second whole-call timeout, enforced by terminating the bridge process.
 
 ## Development
 
@@ -178,4 +235,4 @@ npm run build     # clean + compile to dist/
 
 ## License
 
-MIT
+MIT — upstream © Yahia (theYahia/retailcrm-mcp); `retailcrm/api-client-php` is MIT © RetailCRM.

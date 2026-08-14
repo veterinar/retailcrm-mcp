@@ -1,12 +1,22 @@
 {
   "mcpServers": {
     "retailcrm": {
-      "command": "npx",
-      "args": ["-y", "@theyahia/retailcrm-mcp"],
-      "env": {
-        "RETAILCRM_DOMAIN": "",
-        "RETAILCRM_API_KEY": ""
-      }
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "--init",
+        "-e",
+        "RETAILCRM_DOMAIN",
+        "-e",
+        "RETAILCRM_API_KEY",
+        "-e",
+        "RETAILCRM_READONLY",
+        "-e",
+        "RETAILCRM_RATE_LIMIT",
+        "retailcrm-mcp:3.1.0"
+      ]
     }
   }
 }

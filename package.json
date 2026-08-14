@@ -1,14 +1,17 @@
 {
-  "name": "@theyahia/retailcrm-mcp",
-  "version": "3.0.0",
-  "description": "MCP server for RetailCRM — orders, customers, inventory, payments, tasks & e-commerce analytics (Russia)",
+  "name": "retailcrm-mcp",
+  "version": "3.1.0",
+  "description": "MCP server for RetailCRM — 39 tools for orders, customers, inventory, payments, tasks & e-commerce analytics, transported via the official retailcrm/api-client-php 6.15.32 through a PHP bridge",
   "type": "module",
+  "private": true,
   "main": "dist/index.js",
   "bin": {
     "retailcrm-mcp": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "bin/retailcrm-api.php",
+    "composer.json"
   ],
   "engines": {
     "node": ">=18.0.0"
@@ -38,10 +41,12 @@
     "typescript-eslint": "^8.0.0",
     "vitest": "^4.1.2"
   },
-  "publishConfig": {
-    "access": "public"
-  },
-  "mcpName": "io.github.theYahia/retailcrm-mcp",
+  "contributors": [
+    {
+      "name": "Yahia",
+      "url": "https://github.com/theYahia"
+    }
+  ],
   "keywords": [
     "mcp",
     "mcp-server",
@@ -63,10 +68,5 @@
     "e-commerce"
   ],
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/theYahia/retailcrm-mcp.git"
-  },
-  "homepage": "https://github.com/theYahia/retailcrm-mcp#readme",
   "author": "Yahia"
 }
