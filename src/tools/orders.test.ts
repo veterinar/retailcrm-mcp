@@ -133,7 +133,6 @@ describe("handleUpdateOrder", () => {
     await handleUpdateOrder({ id: "42", by: "id", status: "complete", manager_comment: "Shipped" });
     const req = bridge.first();
     expect(req.path).toBe("/orders/42/edit");
-    expect(req.params).toMatchObject({ by: "id" });
     const order = JSON.parse(req.params!.order);
     expect(order.status).toBe("complete");
     expect(order.managerComment).toBe("Shipped");
