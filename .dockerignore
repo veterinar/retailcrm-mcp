@@ -1,0 +1,12 @@
+.git
+.github
+.claude
+node_modules
+dist
+vendor
+tests
+*.md
+.mcp.json
+smithery.yaml
+.gitignore
+.dockerignore
