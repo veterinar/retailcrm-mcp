@@ -21,3 +21,16 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
+
+  php-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+      - name: Install locked production dependencies
+        run: composer install --no-dev --no-scripts --no-plugins --no-interaction --no-progress
+      - name: PHP client factory smoke test (PSR discovery)
+        run: php tests/php-client-factory-smoke.php
