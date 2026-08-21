@@ -4,6 +4,93 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+PII-free SEO-SXO analytics surface (criteria:
+`docs/criteria/retailcrm-analytics-sxo-v1.md`).
+
+### Added
+- **Five read-only analytics tools** (`retailcrm_attribution_fields`,
+  `retailcrm_orders_analytics`, `retailcrm_paid_orders`,
+  `retailcrm_order_attribution`, `retailcrm_order_history_analytics`) exposing
+  an allowlist-only, PII-free order projection: ids, timestamps, status, order
+  method, site, total/currency, native source/medium/campaign,
+  `retailcrm_client_id` (native label, never Yandex `client_id`), configured
+  attribution tokens, safe item SKU/quantity/revenue/VAT, explicit channel
+  classification and an `HMAC-SHA256(RETAILCRM_ANALYTICS_HMAC_SECRET,
+  "petdog-order-v1:" + normalized_order_id)` pseudonymous join key. Names,
+  phones, emails, addresses, comments, marking codes, user ids and arbitrary
+  custom fields are never emitted; order analytics fail closed when the HMAC
+  secret is absent or < 32 characters.
+- **Complete pagination with explicit bounds.** `/orders` is traversed page by
+  page until complete or a caller-visible `max_pages`/`max_orders` bound
+  (defaults cover 10,000 orders). Stopped results are `partial` with reason +
+  continuation page and never label aggregate revenue complete. Malformed or
+  contradictory provider shapes fail closed.
+- **`retailcrm_order_history_analytics` uses the official `/orders/history`
+  `sinceId` cursor** per docs.retailcrm.ru (WorkingHistoryAPI): the first call
+  carries no `sinceId` unless resuming, `page` is never sent (the API rejects
+  `sinceId`+`page` with HTTP 400 since 2023-05-15), each follow-up sends only
+  `filter[sinceId]` = max processed id, and a non-advancing cursor fails
+  closed. Old/new change values are emitted only for allowlisted
+  status/payment fields; `next_since_id` resumes the feed.
+- Attribution and channel configuration via `RETAILCRM_ANALYTICS_ATTRIBUTION`
+  and `RETAILCRM_ANALYTICS_CHANNEL_MAP` (canonical-key-to-code maps; unknown
+  keys, duplicate codes, malformed JSON and unsafe tokens fail closed or become
+  `null` with an explicit omission reason — nothing is guessed).
+
+### Changed
+- **`orders_history` now honors its `raw` parameter** (criteria #11):
+  `raw:true` preserves the explicit legacy raw payload; the default returns a
+  safe PII-free history projection (allowlisted status/payment changes, join
+  key omitted rather than required when the analytics secret is unconfigured).
+  Existing create/update/list/get behavior and read-only tool filtering are
+  unchanged.
+
+### Fixed
+- **`retailcrm_attribution_fields` scopes its `/custom-fields` request with
+  `filter[entity]=order`** so only order metadata is ever requested (never
+  other entities' metadata, never field values), and accepts the filtered
+  provider shape in which entries omit the `entity` key. Structurally
+  malformed metadata still fails closed; explicitly non-order entries are
+  skipped.
+- **Item projection matches the current OpenAPI** (criterion 3): `vat_rate`
+  is the provider's STRING verbatim (previously number-only, silently
+  nulling live VAT); item SKU precedence is `offer.externalId` → `xmlId` →
+  `article`; item revenue sums EVERY numeric `prices[]` tranche
+  (`price*quantity`) and otherwise falls back to
+  `(initialPrice - per-unit discountTotal) * quantity` — `prices[0]` alone is
+  never used, and malformed numeric material yields null, never a guess.
+- **`retailcrm_paid_orders` windows on full-paid time**
+  (`filter[fullPaidAtFrom]`/`[fullPaidAtTo]`, `date_basis: full_paid_at`) —
+  the tool's business output is paid revenue. `retailcrm_orders_analytics`
+  keeps `createdAt` windows (`date_basis: created_at`). Both state their
+  basis in the output. `paid_at` projection semantics unchanged.
+- **History join-key honesty (criterion 5/10):** history records carry no
+  order `number`, so without an `orderExternalId` no join key is emitted
+  (`join_key: null` + `join_key_omitted_reason: "no_order_external_id"`) —
+  the CRM id is never HMAC-ed as though it matched the /orders basis, which
+  would have silently false-joined records. ExternalId records keep the
+  normal key.
+- **History old/new allowlist is `status` and `payments` only**
+  (criterion 10): `fullPaidAt`, `orderMethod`, `site`, `totalSumm` and
+  `currency` no longer emit old/new values and are omitted entirely.
+- **Legacy `orders_history` cursor calls omit `page`**: when
+  `filter_since_id` is present the request carries no `page` parameter (the
+  official API rejects `sinceId`+`page` with HTTP 400 since 2023-05-15);
+  non-cursor raw/date calls keep `page` exactly as before.
+- **Prototype-key hardening:** the channel map is null-prototype and channel
+  plus configured-custom-field lookups are own-property-only, so inherited
+  keys (`"toString"`, `"__proto__"`) can never become channel
+  classifications or attribution values.
+- **`max_orders`/`max_records` are explicitly page-aligned soft stops**,
+  documented in the schema descriptions and each output's `bounds` block
+  (`semantics: "page_aligned_soft_stop"`): collection halts before fetching
+  another page once the bound is reached, so the final count may overshoot
+  by at most one 100-record page — no output claims a hard per-record cap.
+  Default capacity (>= 10,000) and honest partial/continuation are
+  unchanged.
+
 ## [3.1.0] — 2026-08-14
 
 Transport refactor: the RetailCRM API calls now run through the official

@@ -1,6 +1,6 @@
 # retailcrm-mcp
 
-Production-grade MCP server for **RetailCRM** e-commerce CRM. **39 tools** + 2 prompt skills for managing orders, customers, products, inventory, payments, tasks, references, and analytics via API v5.
+Production-grade MCP server for **RetailCRM** e-commerce CRM. **44 tools** + 2 prompt skills for managing orders, customers, products, inventory, payments, tasks, references, and analytics via API v5.
 
 API traffic is transported by the official [`retailcrm/api-client-php`](https://github.com/retailcrm/api-client-php) client, pinned to **6.15.32**, invoked from Node through a PHP bridge (`bin/retailcrm-api.php`). The server ships as a self-contained Docker image — no host PHP or Composer required.
 
@@ -18,7 +18,7 @@ Read tools return a **compact, shaped summary** of only the fields an agent need
 
 > ⚠️ **v3 was a breaking change** vs v2: default output is the shaped summary instead of raw JSON. Pass `raw:true` to restore the old payload.
 
-## Tools (39)
+## Tools (44)
 
 ### Orders
 | Tool | Description |
@@ -27,7 +27,7 @@ Read tools return a **compact, shaped summary** of only the fields an agent need
 | `get_order` | Get one order by ID or externalId |
 | `create_order` | Create an order; link an existing customer (`customer_id`/`customer_external_id`) or create one inline |
 | `update_order` | Update status, customer, delivery, comments |
-| `orders_history` | Order change history incl. status transitions (incremental sync) |
+| `orders_history` | Order change history (incremental sync). Default: safe PII-free projection (only `status`/`payments` old→new changes); `raw:true` for the untouched payload. Cursor calls (`filter_since_id`) never send `page` — the API rejects `sinceId`+`page` since 2023-05-15 |
 
 ### Customers
 | Tool | Description |
@@ -83,6 +83,20 @@ Read tools return a **compact, shaped summary** of only the fields an agent need
 | `get_orders_summary` | Period-scoped order stats: exact count + revenue, AOV, status distribution |
 | `get_customers_summary` | New-customer count for a date range |
 
+### Analytics: PII-free SEO-SXO surface
+
+Read-only, pagination-complete analytics that a Yandex Metrica layer can join on a pseudonymous key — no customer identity persisted or returned. Criteria: `docs/criteria/retailcrm-analytics-sxo-v1.md`.
+
+| Tool | Description |
+|------|-------------|
+| `retailcrm_attribution_fields` | Search ORDER custom-field *metadata* (code/name/type; request scoped with `filter[entity]=order`) for attribution candidates; never reads field values |
+| `retailcrm_orders_analytics` | PII-free order analytics for a date window (`date_basis: created_at`): full pagination with explicit `max_pages`/`max_orders` bounds, per-order safe fields + HMAC join key |
+| `retailcrm_paid_orders` | Same projection restricted to fully-paid orders; the window filters on full-paid time (`filter[fullPaidAtFrom]`/`[To]`, `date_basis: full_paid_at`); `paid_at` from `fullPaidAt` or a `paymentComplete` payment |
+| `retailcrm_order_attribution` | PII-free attribution for one order by id/externalId |
+| `retailcrm_order_history_analytics` | Incremental change feed via the official `/orders/history` `sinceId` cursor (never sends `page` — the API rejects `sinceId`+`page` since 2023-05-15); returns `next_since_id` for resumption; `totalPageCount>1` signals another cursor fetch, `<=1` completes |
+
+Projection is allowlist-only: ids, timestamps, status, order method, site, total/currency, native source/medium/campaign, `retailcrm_client_id` (native label — never represented as Yandex `client_id`), configured attribution tokens, safe item fields, explicit channel classification and the HMAC-SHA256 join key. Item `revenue` sums every `prices[]` tranche (`price*quantity`) when the tranches are numerically complete, otherwise `(initialPrice - discountTotal) * quantity`; `vat_rate` is the provider's string verbatim; item SKU is `offer.externalId` → `xmlId` → `article`. History old/new values are exposed only for `status` and `payments`; a history record without an `orderExternalId` gets `join_key: null` with `join_key_omitted_reason: "no_order_external_id"` (never a CRM-id HMAC). `max_orders`/`max_records` are page-aligned soft stops (may overshoot by at most one 100-record page), stated in each output's `bounds` block. Names, phones, emails, addresses, comments, marking codes, user ids and arbitrary custom fields are never emitted. All order analytics tools **fail closed** when `RETAILCRM_ANALYTICS_HMAC_SECRET` is absent or shorter than 32 characters.
+
 ## Prompt Skills (2)
 
 | Skill | Description |
@@ -111,6 +125,9 @@ Secrets are provided via environment variables only — never on the command lin
 | `PORT` / `HOST` | No | HTTP server bind (default `3000` / `127.0.0.1`, `--http` mode only) |
 | `RETAILCRM_HTTP_ALLOWED_HOSTS` | No | Comma-separated allowed `Host` values for DNS-rebinding protection |
 | `RETAILCRM_DNS_PROTECTION` | No | `off` to disable DNS-rebinding protection (HTTP mode) |
+| `RETAILCRM_ANALYTICS_HMAC_SECRET` | For analytics | HMAC-SHA256 key for pseudonymous order join keys (>= 32 chars; order analytics fail closed without it) |
+| `RETAILCRM_ANALYTICS_ATTRIBUTION` | No | JSON map of canonical key (`client_id`, `yclid`, `utm_source`, `utm_medium`, `utm_campaign`, `utm_content`, `utm_term`) to exact order custom-field code. No defaults — use `retailcrm_attribution_fields` to discover codes |
+| `RETAILCRM_ANALYTICS_CHANNEL_MAP` | No | JSON map of site/order-method code to `site` / `phone` / `chat` / `marketplace`; unmapped codes classify as `unknown` |
 
 > `RETAILCRM_URL` is still accepted as a fallback for `RETAILCRM_DOMAIN`.
 

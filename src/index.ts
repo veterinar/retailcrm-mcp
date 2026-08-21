@@ -14,6 +14,7 @@ import * as customers from "./tools/customers.js";
 import * as products from "./tools/products.js";
 import * as references from "./tools/references.js";
 import * as analytics from "./tools/analytics.js";
+import * as analyticsSxo from "./tools/analytics-sxo.js";
 import * as inventories from "./tools/inventories.js";
 import * as payments from "./tools/payments.js";
 import * as notes from "./tools/notes.js";
@@ -55,7 +56,7 @@ const TOOLS: ToolDef[] = [
   def("update_order", "Update Order", "write", orders.updateOrderSchema, orders.handleUpdateOrder,
     "Update an order (status, customer, delivery, comments). Only the fields you pass are sent. Returns {success}."),
   def("orders_history", "Orders History", "read", orders.ordersHistorySchema, orders.handleOrdersHistory,
-    "Order change history incl. status transitions; supports incremental sync via filter_since_id and a date window. Returns {history[], pagination}."),
+    "Order change history incl. status transitions; supports incremental sync via filter_since_id and a date window. Cursor calls (filter_since_id) never send page — the API rejects sinceId+page since 2023-05-15. Default returns the SAFE PII-free projection (only status/payments old->new changes); raw:true restores the untouched {history[], pagination} payload."),
 
   // ── Customers ──
   def("list_customers", "List Customers", "read", customers.listCustomersSchema, customers.handleListCustomers,
@@ -146,6 +147,18 @@ const TOOLS: ToolDef[] = [
     "Period-scoped order summary: exact totalCount for the date range plus revenue, average order value, and status distribution aggregated over up to max_pages×100 orders (partial:true if the window exceeds that)."),
   def("get_customers_summary", "Customers Summary", "read", analytics.getCustomersSummarySchema, analytics.handleGetCustomersSummary,
     "Period-scoped new-customer count for a date range. Returns {period, newCustomers}."),
+
+  // ── Analytics: PII-free SEO-SXO surface ──
+  def("retailcrm_attribution_fields", "RetailCRM Attribution Fields", "read", analyticsSxo.attributionFieldsSchema, analyticsSxo.handleAttributionFields,
+    "Search ORDER custom-field metadata (/custom-fields?filter[entity]=order) by code/name for attribution candidates (yclid, UTM, Metrica client_id). Returns code/name/type/entity metadata ONLY — never order field values. Configure exact codes in RETAILCRM_ANALYTICS_ATTRIBUTION before analytics tools will extract them."),
+  def("retailcrm_orders_analytics", "RetailCRM Orders Analytics", "read", analyticsSxo.ordersAnalyticsSchema, analyticsSxo.handleOrdersAnalytics,
+    "PII-free order analytics for a date window (date_basis: created_at): every /orders page until complete or an explicit max_pages/max_orders bound (defaults cover 10,000+; max_orders is a page-aligned soft stop stated in the output bounds block). Each order: ids, timestamps, status, method, site, total, native source/medium/campaign, retailcrm_client_id (native label, NOT Yandex client_id), configured attribution tokens, safe item SKU/qty/revenue/VAT, explicit channel classification and an HMAC-SHA256 pseudonymous join key. Fails closed without RETAILCRM_ANALYTICS_HMAC_SECRET (>=32 chars)."),
+  def("retailcrm_paid_orders", "RetailCRM Paid Orders", "read", analyticsSxo.paidOrdersSchema, analyticsSxo.handlePaidOrders,
+    "Same PII-free analytics projection as retailcrm_orders_analytics, restricted to fully-paid orders, with the window on FULL-PAID time (filter[fullPaidAtFrom]/[fullPaidAtTo], date_basis: full_paid_at) because the business output is paid revenue. paid_at from order fullPaidAt, falling back to paidAt of a payment whose status is paymentComplete (/reference/payment-statuses). Reports paid_count; stopped collections are partial with reason + continuation page."),
+  def("retailcrm_order_attribution", "RetailCRM Order Attribution", "read", analyticsSxo.orderAttributionSchema, analyticsSxo.handleOrderAttribution,
+    "PII-free attribution for ONE order by id/externalId: native source/medium/campaign, retailcrm_client_id (native label, NOT Yandex client_id), configured attribution tokens (client_id/yclid/UTM from exact custom-field codes only), channel classification and HMAC join key. Config: RETAILCRM_ANALYTICS_ATTRIBUTION map + RETAILCRM_ANALYTICS_HMAC_SECRET (>=32 chars)."),
+  def("retailcrm_order_history_analytics", "RetailCRM Order History Analytics", "read", analyticsSxo.orderHistoryAnalyticsSchema, analyticsSxo.handleOrderHistoryAnalytics,
+    "PII-free incremental order-change feed via the official /orders/history sinceId cursor: the first call carries no sinceId (or the caller's resume cursor) and page is NEVER sent (the API rejects sinceId+page since 2023-05-15); each follow-up sends only filter[sinceId]=max processed id, with totalPageCount>1 signaling another fetch and <=1 completing the feed. Returns allowlisted status/payment old->new diffs, HMAC join keys, next_since_id, completeness and continuation. Fails closed without RETAILCRM_ANALYTICS_HMAC_SECRET (>=32 chars)."),
 ];
 
 function annotationsFor(t: ToolDef) {
