@@ -2,6 +2,7 @@ import { z } from "zod";
 import { retailCrmGet, retailCrmPost } from "../client.js";
 import { ok, fail, runTool, toOrderView, toOrderSummary, presentOrderList, type ToolResult } from "../format/index.js";
 import { dateField, detailField, rawField, siteField, pageField, limitField } from "./common.js";
+import { checkAnalyticsSecret, projectHistoryRecord, type HistoryRecord } from "./analytics-sxo.js";
 import type { RawOrder } from "../types.js";
 
 // ── list_orders ──────────────────────────────────────────────
@@ -184,12 +185,48 @@ export const ordersHistorySchema = z.object({
 
 export async function handleOrdersHistory(params: z.infer<typeof ordersHistorySchema>): Promise<ToolResult> {
   return runTool(async () => {
-    const query: Record<string, string> = { page: String(params.page), limit: String(params.limit) };
-    if (params.filter_since_id !== undefined) query["filter[sinceId]"] = String(params.filter_since_id);
+    const query: Record<string, string> = { limit: String(params.limit) };
+    if (params.filter_since_id !== undefined) {
+      // Official WorkingHistoryAPI contract: filter[sinceId] sent together
+      // with page is rejected with HTTP 400 since 2023-05-15 — a cursor call
+      // must never carry page.
+      query["filter[sinceId]"] = String(params.filter_since_id);
+    } else {
+      query.page = String(params.page);
+    }
     if (params.filter_date_from) query["filter[startDate]"] = params.filter_date_from;
     if (params.filter_date_to) query["filter[endDate]"] = params.filter_date_to;
     if (params.filter_order_id !== undefined) query["filter[orderId]"] = String(params.filter_order_id);
     const result = await retailCrmGet("/orders/history", query);
-    return ok(result);
+    // raw:true preserves the explicit legacy raw response, untouched.
+    if (params.raw) return ok(result);
+    // Default (criteria #11): the safe PII-free history projection. This legacy
+    // ops tool never fails on a missing analytics secret — the join key is
+    // simply omitted (null) when the secret is not configured.
+    const secretCheck = checkAnalyticsSecret();
+    const ctx = secretCheck.ok ? { secret: secretCheck.secret } : null;
+    const rawHistory = (result as { history?: unknown } | null | undefined)?.history;
+    if (!Array.isArray(rawHistory)) return fail("RetailCRM /orders/history response is malformed (history array missing)");
+    const projected: HistoryRecord[] = [];
+    for (const rec of rawHistory) {
+      const p = projectHistoryRecord(rec, ctx);
+      if ("error" in p) return fail(p.error);
+      projected.push(p);
+    }
+    const pg = (result as { pagination?: unknown } | null | undefined)?.pagination as { currentPage?: unknown; totalCount?: unknown } | null | undefined;
+    const currentPageRaw = pg?.currentPage;
+    const page = typeof currentPageRaw === "number" ? currentPageRaw : params.page;
+    const totalCountRaw = pg?.totalCount;
+    const totalCount = typeof totalCountRaw === "number" ? totalCountRaw : null;
+    return ok({
+      history: projected,
+      pagination: {
+        page,
+        totalCount,
+        returned: projected.length,
+        hasMore: totalCount !== null ? page * params.limit < totalCount : null,
+      },
+      note: "Safe projection: only allowlisted status/payment changes are emitted; pass raw:true for the untouched RetailCRM payload.",
+    });
   });
 }
