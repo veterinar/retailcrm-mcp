@@ -372,6 +372,27 @@ describe("retailcrm_attribution_fields", () => {
     expect(r.text).not.toContain("customer_note");   // non-order entities are skipped entirely
   });
 
+  it("accepts the live array response shape while keeping the metadata allowlist", async () => {
+    const bridge = mockBridge([{
+      success: true,
+      customFields: [
+        { code: "utm_source_store", name: "UTM source", type: "string", entity: "order" },
+        { code: "order_secret", name: "Internal", type: "string", entity: "order" },
+        { code: "customer_utm", name: "Customer UTM", type: "text", entity: "customer" },
+      ],
+    }]);
+    const r = await handleAttributionFields({ search: "utm" });
+    expect(r.isError).toBeFalsy();
+    const parsed = JSON.parse(r.text);
+    expect(bridge.first()?.params).toEqual({ "filter[entity]": "order" });
+    expect(parsed.total_order_fields).toBe(2);
+    expect(parsed.fields).toEqual([
+      { code: "utm_source_store", name: "UTM source", type: "string", entity: "order" },
+    ]);
+    expect(r.text).not.toContain("Internal");
+    expect(r.text).not.toContain("Customer UTM");
+  });
+
   it("scopes the /custom-fields request to order metadata and accepts the filtered shape", async () => {
     const bridge = mockBridge([{
       success: true,

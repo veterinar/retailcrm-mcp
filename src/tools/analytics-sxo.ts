@@ -498,17 +498,24 @@ export async function handleAttributionFields(params: z.infer<typeof attribution
     // or any field VALUES (custom_fields_read scope only).
     const resp = await retailCrmGet("/custom-fields", { "filter[entity]": "order" }) as { customFields?: unknown };
     const map = resp?.customFields;
-    if (map === null || typeof map !== "object" || Array.isArray(map)) {
-      throw new Error("RetailCRM /custom-fields response is malformed (customFields object missing)");
+    if (map === null || typeof map !== "object") {
+      throw new Error("RetailCRM /custom-fields response is malformed (customFields container missing)");
     }
+    const arrayForm = Array.isArray(map);
+    const entries: [string, unknown][] = arrayForm
+      ? map.map((entry, index): [string, unknown] => [String(index), entry])
+      : Object.entries(map as Record<string, unknown>);
     const fields: { code: string; name: string | null; type: string | null; entity: string }[] = [];
     let orderFields = 0;
     const needle = params.search.toLowerCase();
-    for (const [key, entry] of Object.entries(map as Record<string, unknown>)) {
+    for (const [key, entry] of entries) {
       if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
         throw new Error(`RetailCRM custom field "${key}" metadata is malformed`);
       }
       const e = entry as { code?: unknown; name?: unknown; type?: unknown; entity?: unknown };
+      if (arrayForm && (typeof e.code !== "string" || e.code === "")) {
+        throw new Error(`RetailCRM custom field at array index ${key} metadata is malformed (code missing)`);
+      }
       // Because the request is entity-filtered, the provider may omit the
       // entity key on returned entries; an explicitly non-order entity is out
       // of scope and skipped. Structurally malformed entries still fail closed.
