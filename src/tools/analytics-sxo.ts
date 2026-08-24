@@ -21,8 +21,18 @@ interface AsxItemRaw {
   quantity?: number;
   initialPrice?: number;
   discountTotal?: number;
-  prices?: { price?: number; quantity?: number }[] | null;
+  // Provider payloads may contain null/undefined/primitive entries; each tranche
+  // is validated before any dereference — never asserted into a typed shape.
+  prices?: unknown[] | null;
   vatRate?: string;
+  purchasePrice?: number;
+  isCanceled?: boolean;
+}
+
+/** A raw provider item entry is usable only when it is a plain non-array object. */
+function safeItemRaw(v: unknown): AsxItemRaw | null {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return null;
+  return v as AsxItemRaw;
 }
 
 interface AsxPaymentRaw { status?: string; paidAt?: string }
@@ -41,8 +51,9 @@ interface AsxOrderRaw {
   fullPaidAt?: string;
   source?: { source?: string; medium?: string; campaign?: string } | string | null;
   customFields?: Record<string, unknown> | null;
-  items?: AsxItemRaw[] | null;
+  items?: unknown[] | null;
   payments?: Record<string, AsxPaymentRaw> | null;
+  delivery?: { code?: string; cost?: number; netCost?: number; vatRate?: string; address?: unknown; service?: unknown } | null;
 }
 
 // ── HMAC join key ────────────────────────────────────────────
@@ -168,10 +179,95 @@ function buildAttribution(customFields: Record<string, unknown> | null | undefin
 export const configuredAttributionKeys = (cfg: AttributionConfig): string[] =>
   cfg.configured ? Object.keys(cfg.codes).sort() : [];
 
+// ── Optional economics configuration (explicit, never guessed) ─
+
+const ECONOMICS_KEYS = ["outside_mkad_surcharge", "commission_total", "return_total"] as const;
+export type EconomicsKey = (typeof ECONOMICS_KEYS)[number];
+
+export type EconomicsConfig =
+  | { configured: false }
+  | { configured: true; codes: Partial<Record<EconomicsKey, string>> };
+
+const isEconomicsKey = (k: string): k is EconomicsKey => (ECONOMICS_KEYS as readonly string[]).includes(k);
+
+export function loadEconomicsConfig(env: NodeJS.ProcessEnv = process.env): EconomicsConfig | { error: string } {
+  const raw = env.RETAILCRM_ANALYTICS_ECONOMICS;
+  if (!raw) return { configured: false };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { error: "RETAILCRM_ANALYTICS_ECONOMICS is not valid JSON (expected {canonical_key: custom_field_code})" };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { error: "RETAILCRM_ANALYTICS_ECONOMICS must be a JSON object mapping canonical keys to custom-field codes" };
+  }
+  const codes: Partial<Record<EconomicsKey, string>> = {};
+  const seen = new Set<string>();
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!isEconomicsKey(key)) {
+      return { error: `RETAILCRM_ANALYTICS_ECONOMICS: unknown key "${key}" (allowed: ${ECONOMICS_KEYS.join(", ")})` };
+    }
+    if (typeof value !== "string" || value.trim() === "") {
+      return { error: `RETAILCRM_ANALYTICS_ECONOMICS: key "${key}" must map to a non-empty custom-field code` };
+    }
+    const code = value.trim();
+    if (seen.has(code)) return { error: `RETAILCRM_ANALYTICS_ECONOMICS: duplicate custom-field code "${code}"` };
+    seen.add(code);
+    codes[key] = code;
+  }
+  return { configured: true, codes };
+}
+
+export type EconomicsAmountView = {
+  value: number | null;
+  field_code: string | null;
+  source: "configured_custom_field" | "unconfigured";
+  omitted_reason: string | null;
+};
+
+/** Only finite non-negative NUMBERS are economics amounts — strings are never coerced. */
+function extractEconomicsAmounts(
+  customFields: Record<string, unknown> | null | undefined, cfg: EconomicsConfig,
+): Record<EconomicsKey, EconomicsAmountView> {
+  const out: Record<EconomicsKey, EconomicsAmountView> = {} as Record<EconomicsKey, EconomicsAmountView>;
+  for (const key of ECONOMICS_KEYS) {
+    const code = cfg.configured ? cfg.codes[key] : undefined;
+    if (!code) {
+      out[key] = { value: null, field_code: null, source: "unconfigured", omitted_reason: "not_configured" };
+      continue;
+    }
+    const cf = customFields !== null && typeof customFields === "object" && !Array.isArray(customFields)
+      ? customFields as Record<string, unknown> : null;
+    if (cf === null || !hasOwn(cf, code)) {
+      out[key] = { value: null, field_code: code, source: "configured_custom_field", omitted_reason: "field_absent_on_order" };
+      continue;
+    }
+    const v = cf[code];
+    if (!isFiniteNumber(v) || v < 0) {
+      out[key] = { value: null, field_code: code, source: "configured_custom_field", omitted_reason: "not_a_finite_non_negative_number" };
+      continue;
+    }
+    out[key] = { value: v, field_code: code, source: "configured_custom_field", omitted_reason: null };
+  }
+  return out;
+}
+
+export const configuredEconomicsKeys = (cfg: EconomicsConfig): string[] =>
+  cfg.configured ? Object.keys(cfg.codes).sort() : [];
+
 // ── Channel classification (explicit mapping only) ───────────
 
-const CHANNELS = ["site", "phone", "chat", "marketplace", "unknown"] as const;
+const CHANNELS = ["site", "phone", "chat", "ozon", "other_marketplace", "unknown"] as const;
 export type Channel = (typeof CHANNELS)[number];
+
+// Namespaced v2 prefixes, checked in classification-precedence source order.
+const CHANNEL_BASIS_PREFIX: Record<Exclude<ChannelBasis, "unmapped">, string> = {
+  order_method: "order_method:",
+  site: "site:",
+  source: "source:",
+  delivery: "delivery:",
+};
 
 export function loadChannelMap(env: NodeJS.ProcessEnv = process.env): { map: Record<string, Channel> } | { error: string } {
   const raw = env.RETAILCRM_ANALYTICS_CHANNEL_MAP;
@@ -188,33 +284,65 @@ export function loadChannelMap(env: NodeJS.ProcessEnv = process.env): { map: Rec
   // Null-prototype map: no inherited keys can ever resolve as channel lookups.
   const map: Record<string, Channel> = Object.create(null);
   for (const [code, value] of Object.entries(parsed as Record<string, unknown>)) {
-    if (typeof value !== "string" || !(CHANNELS as readonly string[]).includes(value)) {
+    if (code === "") {
+      return { error: "RETAILCRM_ANALYTICS_CHANNEL_MAP: empty map key is not allowed" };
+    }
+    if (typeof value !== "string") {
       return { error: `RETAILCRM_ANALYTICS_CHANNEL_MAP: unknown channel ${JSON.stringify(value)} for code "${code}" (allowed: ${CHANNELS.join(", ")})` };
     }
-    map[code] = value as Channel;
+    // Legacy input alias: criterion v1 allowed `marketplace`; it normalizes
+    // immediately to the canonical output `other_marketplace` and is never emitted.
+    const normalized: string = value === "marketplace" ? "other_marketplace" : value;
+    if (!(CHANNELS as readonly string[]).includes(normalized)) {
+      return { error: `RETAILCRM_ANALYTICS_CHANNEL_MAP: unknown channel ${JSON.stringify(value)} for code "${code}" (allowed: ${CHANNELS.join(", ")})` };
+    }
+    map[code] = normalized as Channel;
   }
   return { map };
 }
 
-/** orderMethod lookup first, then site — own-property only, so inherited keys ("toString", "__proto__") can never resolve. Anything else is explicitly "unknown". */
-function classifyChannel(o: AsxOrderRaw, map: Record<string, Channel>): { value: Channel; basis: "order_method" | "site" | "unmapped" } {
-  if (o.orderMethod && hasOwn(map, o.orderMethod)) return { value: map[o.orderMethod], basis: "order_method" };
-  if (o.site && hasOwn(map, o.site)) return { value: map[o.site], basis: "site" };
+export type ChannelBasis = "order_method" | "site" | "source" | "delivery" | "unmapped";
+
+/**
+ * v2 precedence per source order: namespaced then legacy lookup for
+ * orderMethod, then site, then native source code, then delivery code.
+ * Own-property lookups only — inherited keys ("toString", "__proto__") never
+ * resolve. No free-text guessing: anything else is explicitly "unknown".
+ */
+export function classifyChannel(o: AsxOrderRaw, map: Record<string, Channel>): { value: Channel; basis: ChannelBasis } {
+  const sourceCode = typeof o.source === "string"
+    ? o.source
+    : o.source !== null && typeof o.source === "object" && typeof o.source.source === "string" ? o.source.source : null;
+  const deliveryCode = o.delivery !== null && typeof o.delivery === "object" && typeof o.delivery.code === "string" ? o.delivery.code : null;
+  const candidates: [Exclude<ChannelBasis, "unmapped">, string | null][] = [
+    ["order_method", typeof o.orderMethod === "string" ? o.orderMethod : null],
+    ["site", typeof o.site === "string" ? o.site : null],
+    ["source", sourceCode],
+    ["delivery", deliveryCode],
+  ];
+  for (const [basis, code] of candidates) {
+    if (code === null || code === "") continue;
+    const namespaced = CHANNEL_BASIS_PREFIX[basis] + code;
+    if (hasOwn(map, namespaced)) return { value: map[namespaced], basis };
+    if (hasOwn(map, code)) return { value: map[code], basis };
+  }
   return { value: "unknown", basis: "unmapped" };
 }
 
 // ── Shared guard (fail closed before any bridge call) ────────
 
-type AnalyticsGuard = { secret: string; attribution: AttributionConfig; channelMap: Record<string, Channel> };
+type AnalyticsGuard = { secret: string; attribution: AttributionConfig; economics: EconomicsConfig; channelMap: Record<string, Channel> };
 
 function guardConfig(): AnalyticsGuard | { error: string } {
   const secretCheck = checkAnalyticsSecret();
   if (!secretCheck.ok) return { error: secretCheck.reason };
   const attribution = loadAttributionConfig();
   if ("error" in attribution) return attribution;
+  const economics = loadEconomicsConfig();
+  if ("error" in economics) return economics;
   const channelMap = loadChannelMap();
   if ("error" in channelMap) return channelMap;
-  return { secret: secretCheck.secret, attribution, channelMap: channelMap.map };
+  return { secret: secretCheck.secret, attribution, economics, channelMap: channelMap.map };
 }
 
 // ── Paid statuses (paymentComplete) ──────────────────────────
@@ -238,6 +366,60 @@ export async function fetchPaidStatusCodes(): Promise<Set<string>> {
 
 // ── PII-free projection ──────────────────────────────────────
 
+/** Item VAT evidence: only unambiguous exactly-10%/22% representations are accepted. */
+export type ItemVatStatus = "accepted_10_22" | "missing" | "unexpected";
+
+const ACCEPTED_VAT_RATES = ["10%", "10", "22%", "22", "vat10", "vat22"] as const;
+
+/** Exact VAT strings meaning exactly 10% or 22% (case-insensitive; optional % and zero decimals). */
+export function vatStatus(v?: string | null): ItemVatStatus {
+  if (typeof v !== "string") return "missing";
+  const s = v.trim();
+  if (s === "") return "missing";
+  const lower = s.toLowerCase();
+  if ((ACCEPTED_VAT_RATES as readonly string[]).includes(lower)) return "accepted_10_22";
+  // 10.0% / 22.00 — zero decimals only, no other numeric value.
+  if (/^(10|22)(\.0+)?%?$/i.test(s)) return "accepted_10_22";
+  return "unexpected";
+}
+
+export type AnalyticsItem = {
+  sku: string | null;
+  quantity: number | null;
+  revenue: number | null;
+  vat_rate: string | null;
+  vat_status: ItemVatStatus;
+  purchase_price: number | null;
+  cogs: number | null;
+  cancelled: boolean | null;
+};
+
+export type AnalyticsDelivery = {
+  code: string | null;
+  cost: number | null;
+  net_cost: number | null;
+  vat_rate: string | null;
+};
+
+export type EconomicsCompleteness = {
+  item_cogs: boolean;
+  item_vat: boolean;
+  delivery_actual_cost: boolean;
+  outside_mkad_surcharge: boolean;
+  commission_total: boolean;
+  return_total: boolean;
+};
+
+export type OrderEconomics = {
+  item_cogs_total: number | null;
+  delivery_actual_cost: number | null;
+  outside_mkad_surcharge: EconomicsAmountView;
+  commission_total: EconomicsAmountView;
+  return_total: EconomicsAmountView;
+  known_costs_total: number | null;
+  completeness: EconomicsCompleteness;
+};
+
 export type AnalyticsOrder = {
   id: number;
   external_id: string | null;
@@ -253,8 +435,10 @@ export type AnalyticsOrder = {
   retailcrm_client_id: string | null;
   retailcrm_client_id_source: "retailcrm_native_clientId";
   attribution: Record<string, AttributionTokenView>;
-  items: { sku: string | null; quantity: number | null; revenue: number | null; vat_rate: string | null }[];
-  channel: { value: Channel; basis: "order_method" | "site" | "unmapped" };
+  items: AnalyticsItem[];
+  delivery: AnalyticsDelivery | null;
+  channel: { value: Channel; basis: ChannelBasis };
+  economics: OrderEconomics;
   join_key: string | null;
 };
 
@@ -268,10 +452,12 @@ const isFiniteNumber = (v: unknown): v is number => typeof v === "number" && Num
  * Item revenue from the FINAL realization prices (current OpenAPI evidence):
  * when a non-empty prices[] consists entirely of numeric price+quantity
  * tranches, every price*quantity is summed. Otherwise fall back to
- * (initialPrice - discountTotal) * quantity — discountTotal is per-unit and
- * includes allocated order discount. Malformed numeric material yields null
- * (or the documented fallback when its inputs are genuine); amounts are
- * never guessed.
+ * initialPrice * quantity - discountTotal — discountTotal is the TOTAL
+ * discount applied to the line (src/types.ts), not per-unit. A usable
+ * tranche requires finite non-negative price AND quantity; a negative or
+ * malformed entry invalidates the whole prices path. Malformed or negative
+ * numeric material yields null; amounts are never guessed, never clamped
+ * to zero and never coerced from strings.
  */
 function itemRevenue(it: AsxItemRaw, quantity: number | null): number | null {
   const prices = Array.isArray(it.prices) ? it.prices : [];
@@ -279,20 +465,76 @@ function itemRevenue(it: AsxItemRaw, quantity: number | null): number | null {
     let total = 0;
     let allValid = true;
     for (const t of prices) {
-      if (isFiniteNumber(t.price) && isFiniteNumber(t.quantity)) {
-        total += t.price * t.quantity;
+      if (t === null || typeof t !== "object") {
+        allValid = false;
+        break;
+      }
+      const tranche = t as { price?: unknown; quantity?: unknown };
+      if (nonNegativeFinite(tranche.price) && nonNegativeFinite(tranche.quantity)) {
+        total += tranche.price * tranche.quantity;
       } else {
         allValid = false;
         break;
       }
     }
-    if (allValid) return round2(total);
+    if (allValid && Number.isFinite(total)) return round2(total);
   }
-  if (quantity === null) return null;
-  if (!isFiniteNumber(it.initialPrice)) return null;
-  if (it.discountTotal !== undefined && it.discountTotal !== null && !isFiniteNumber(it.discountTotal)) return null;
-  const discount = isFiniteNumber(it.discountTotal) ? it.discountTotal : 0;
-  return round2((it.initialPrice - discount) * quantity);
+  // Fallback only on genuine finite non-negative inputs.
+  if (!nonNegativeFinite(quantity)) return null;
+  if (!nonNegativeFinite(it.initialPrice)) return null;
+  if (it.discountTotal !== undefined && it.discountTotal !== null && !nonNegativeFinite(it.discountTotal)) return null;
+  const discount = nonNegativeFinite(it.discountTotal) ? it.discountTotal : 0;
+  const amount = it.initialPrice * quantity - discount;
+  if (!Number.isFinite(amount) || amount < 0) return null;
+  return round2(amount);
+}
+
+const nonNegativeFinite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
+
+/** Safe delivery projection: only {code, cost, net_cost, vat_rate} — never address/service/recipient/comments. */
+export function projectDelivery(d: AsxOrderRaw["delivery"]): AnalyticsDelivery | null {
+  if (d === null || typeof d !== "object") return null;
+  return {
+    code: typeof d.code === "string" ? d.code : null,
+    cost: nonNegativeFinite(d.cost) ? d.cost : null,
+    net_cost: nonNegativeFinite(d.netCost) ? d.netCost : null,
+    vat_rate: typeof d.vatRate === "string" ? d.vatRate : null,
+  };
+}
+
+/**
+ * Per-order economics (v2 criterion 7): known components only — missing ones
+ * stay null, never zero. item_cogs_total requires EVERY item to have a
+ * non-null cogs (zero items => null). known_costs_total is the bounded sum of
+ * the non-null known components, not a profit claim.
+ */
+export function buildEconomics(items: AnalyticsItem[], delivery: AnalyticsDelivery | null, customFields: Record<string, unknown> | null | undefined, cfg: EconomicsConfig): OrderEconomics {
+  const cogsValues = items.map(it => it.cogs);
+  const itemCogsTotal = items.length > 0 && cogsValues.every(c => c !== null)
+    ? round2(cogsValues.reduce((sum, c) => sum + (c as number), 0))
+    : null;
+  const amounts = extractEconomicsAmounts(customFields, cfg);
+  const deliveryActualCost = delivery !== null ? delivery.net_cost : null;
+  const components = [itemCogsTotal, deliveryActualCost, ...ECONOMICS_KEYS.map(k => amounts[k].value)];
+  const known = components.filter((v): v is number => v !== null);
+  const knownCostsTotal = known.length > 0 ? round2(known.reduce((a, b) => a + b, 0)) : null;
+  return {
+    item_cogs_total: itemCogsTotal,
+    delivery_actual_cost: deliveryActualCost,
+    outside_mkad_surcharge: amounts.outside_mkad_surcharge,
+    commission_total: amounts.commission_total,
+    return_total: amounts.return_total,
+    known_costs_total: knownCostsTotal,
+    completeness: {
+      item_cogs: itemCogsTotal !== null,
+      // True only for a NON-EMPTY item list whose every item is accepted_10_22.
+      item_vat: items.length > 0 && items.every(it => it.vat_status === "accepted_10_22"),
+      delivery_actual_cost: deliveryActualCost !== null,
+      outside_mkad_surcharge: amounts.outside_mkad_surcharge.value !== null,
+      commission_total: amounts.commission_total.value !== null,
+      return_total: amounts.return_total.value !== null,
+    },
+  };
 }
 
 export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: AnalyticsOrder; paid: boolean } | { error: string } {
@@ -316,17 +558,34 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
   const src = typeof o.source === "string"
     ? { source: o.source, medium: null, campaign: null }
     : { source: o.source?.source ?? null, medium: o.source?.medium ?? null, campaign: o.source?.campaign ?? null };
-  const items = (Array.isArray(o.items) ? o.items : []).map(it => {
-    const quantity = isFiniteNumber(it.quantity) ? it.quantity : null;
+  // A malformed entry (null/undefined/primitive/array) becomes one fail-closed
+  // safe item: every evidence field null except vat_status "missing"; it makes
+  // item COGS/VAT completeness false. Never dereferenced before validation.
+  const items: AnalyticsItem[] = (Array.isArray(o.items) ? o.items : []).map((raw): AnalyticsItem => {
+    const it = safeItemRaw(raw);
+    if (it === null) {
+      return { sku: null, quantity: null, revenue: null, vat_rate: null, vat_status: "missing", purchase_price: null, cogs: null, cancelled: null };
+    }
+    // Quantity is evidence only when finite and non-negative.
+    const quantity = nonNegativeFinite(it.quantity) ? it.quantity : null;
+    // COGS = purchase_price * quantity only when BOTH are finite and non-negative.
+    const purchasePrice = nonNegativeFinite(it.purchasePrice) ? it.purchasePrice : null;
+    const cogs = purchasePrice !== null && quantity !== null ? round2(purchasePrice * quantity) : null;
     return {
       // SKU precedence per current OpenAPI OrderProduct/offer: externalId, then xmlId, then article.
       sku: it.offer?.externalId ?? it.offer?.xmlId ?? it.offer?.article ?? null,
       quantity,
       // vatRate is a STRING in the current OpenAPI (e.g. "20%"); never coerced.
       vat_rate: typeof it.vatRate === "string" ? it.vatRate : null,
+      vat_status: vatStatus(it.vatRate),
       revenue: itemRevenue(it, quantity),
+      purchase_price: purchasePrice,
+      cogs,
+      cancelled: typeof it.isCanceled === "boolean" ? it.isCanceled : null,
     };
   });
+  const delivery = projectDelivery(o.delivery);
+  const economics = buildEconomics(items, delivery, o.customFields, ctx.economics);
   return {
     order: {
       id: o.id,
@@ -337,7 +596,9 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
       status: typeof o.status === "string" ? o.status : null,
       order_method: typeof o.orderMethod === "string" ? o.orderMethod : null,
       site: typeof o.site === "string" ? o.site : null,
-      total: typeof o.totalSumm === "number" ? o.totalSumm : null,
+      // Fail-closed amount contract: only a finite non-negative totalSumm is
+      // evidence; negative/NaN/Infinity project as null (never coerced to zero).
+      total: nonNegativeFinite(o.totalSumm) ? o.totalSumm : null,
       currency: typeof o.currency === "string" ? o.currency : null,
       source: src,
       // Native RetailCRM analytics label — explicitly NOT Yandex Metrica client_id.
@@ -345,7 +606,9 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
       retailcrm_client_id_source: "retailcrm_native_clientId",
       attribution: buildAttribution(o.customFields, ctx.attribution),
       items,
+      delivery,
       channel: classifyChannel(o, ctx.channelMap),
+      economics,
       join_key: orderJoinKey(o, ctx.secret),
     },
     paid: typeof o.fullPaidAt === "string" || completePayments.length > 0,
@@ -361,6 +624,7 @@ type CollectedAnalytics = {
   partial_reason: "max_pages" | "max_orders" | null;
   continuation_page: number | null;
   generated_at: string | null;
+  pages_fetched: number;
 };
 
 export type DateBasis = "created_at" | "full_paid_at";
@@ -382,10 +646,10 @@ export async function collectAnalyticsOrders(
 
   for (;;) {
     if (collected.length >= maxOrders) {
-      return finish(collected, windowTotalCount, false, "max_orders", page, generatedAt);
+      return finish(collected, windowTotalCount, false, "max_orders", page, generatedAt, pagesFetched);
     }
     if (pagesFetched >= maxPages) {
-      return finish(collected, windowTotalCount, false, "max_pages", page, generatedAt);
+      return finish(collected, windowTotalCount, false, "max_pages", page, generatedAt, pagesFetched);
     }
     const resp = await retailCrmGet("/orders", {
       [fromKey]: dateFrom,
@@ -417,32 +681,33 @@ export async function collectAnalyticsOrders(
 
     if (rawOrders.length === 0) {
       if (totalPageCount > page) throw new Error("RetailCRM /orders claimed more pages but returned an empty page");
-      return finishComplete(collected, windowTotalCount, generatedAt);
+      return finishComplete(collected, windowTotalCount, generatedAt, pagesFetched);
     }
     if (totalPageCount < page) throw new Error("RetailCRM /orders returned orders for a page beyond totalPageCount");
     if (collected.length > totalCount) throw new Error("RetailCRM /orders returned more orders than totalCount");
-    if (page >= totalPageCount) return finishComplete(collected, windowTotalCount, generatedAt);
+    if (page >= totalPageCount) return finishComplete(collected, windowTotalCount, generatedAt, pagesFetched);
     page++;
   }
 }
 
 /** Complete result — but only if the provider's own totalCount agrees with what we traversed. */
 function finishComplete(
-  orders: CollectedAnalytics["orders"], windowTotalCount: number, generatedAt: string | null,
+  orders: CollectedAnalytics["orders"], windowTotalCount: number, generatedAt: string | null, pagesFetched: number,
 ): CollectedAnalytics {
   if (orders.length !== windowTotalCount) {
     throw new Error(`RetailCRM /orders pagination is inconsistent: collected ${orders.length} orders but totalCount is ${windowTotalCount}`);
   }
-  return { orders, window_total_count: windowTotalCount, complete: true, partial_reason: null, continuation_page: null, generated_at: generatedAt };
+  return { orders, window_total_count: windowTotalCount, complete: true, partial_reason: null, continuation_page: null, generated_at: generatedAt, pages_fetched: pagesFetched };
 }
 
 function finish(
   orders: CollectedAnalytics["orders"], windowTotalCount: number, complete: boolean,
-  partialReason: CollectedAnalytics["partial_reason"], continuationPage: number | null, generatedAt: string | null,
+  partialReason: CollectedAnalytics["partial_reason"], continuationPage: number | null, generatedAt: string | null, pagesFetched: number,
 ): CollectedAnalytics {
   return {
     orders, window_total_count: windowTotalCount, complete,
     partial_reason: partialReason, continuation_page: continuationPage, generated_at: generatedAt,
+    pages_fetched: pagesFetched,
   };
 }
 
@@ -451,7 +716,18 @@ function analyticsEnvelope(
   bounds: { max_pages: number; max_orders: number },
 ) {
   const orders = c.orders.map(e => e.order);
-  const revenue = round2(orders.reduce((sum, o) => sum + (o.total ?? 0), 0));
+  // Fail-closed amounts: a missing order total (null) never silently becomes
+  // zero in a publishable aggregate. Any missing total => revenue/AOV null
+  // and the result is not publishable, even when traversal is complete.
+  const totalsPresent = orders.filter(o => o.total !== null).length;
+  const totalsMissing = orders.length - totalsPresent;
+  const allTotalsPresent = totalsMissing === 0;
+  const revenue = allTotalsPresent
+    ? round2(orders.reduce((sum, o) => sum + (o.total ?? 0), 0))
+    : null;
+  const averageOrderValue = allTotalsPresent && orders.length ? round2((revenue as number) / orders.length) : null;
+  // Publishable only when traversal is complete AND no order total is missing.
+  const publishable = c.complete && allTotalsPresent;
   return {
     period: { from: dateFrom, to: dateTo },
     date_basis: dateBasis,
@@ -459,6 +735,12 @@ function analyticsEnvelope(
     count: orders.length,
     window_total_count: c.window_total_count,
     complete: c.complete,
+    // publication_status stays about TRAVERSAL only; missing values are
+    // reported separately via total_amount_completeness and revenue_scope.
+    publication_status: c.complete ? "complete" as const : "partial" as const,
+    publishable,
+    total_amount_completeness: { present: totalsPresent, missing: totalsMissing },
+    pages_fetched: c.pages_fetched,
     partial_reason: c.partial_reason,
     continuation_page: c.continuation_page,
     bounds: {
@@ -473,12 +755,26 @@ function analyticsEnvelope(
     },
     totals: {
       revenue,
-      average_order_value: orders.length ? round2(revenue / orders.length) : null,
-      revenue_scope: c.complete ? "complete" : "partial_window",
+      average_order_value: averageOrderValue,
+      revenue_scope: !c.complete ? "partial_window" as const : allTotalsPresent ? "complete" as const : "incomplete_values" as const,
+      // A partial or value-incomplete result keeps its bounded observed
+      // subtotal (or null) for diagnosis only — it is never publishable as a
+      // complete aggregate.
+      publishable,
     },
     channel_completeness: {
       mapped: orders.filter(o => o.channel.value !== "unknown").length,
       unknown: orders.filter(o => o.channel.value === "unknown").length,
+    },
+    economics_completeness: {
+      order_count: orders.length,
+      // Presence counts only — a missing component is never counted as zero.
+      complete_item_cogs: orders.filter(o => o.economics.completeness.item_cogs).length,
+      accepted_item_vat: orders.filter(o => o.economics.completeness.item_vat).length,
+      delivery_actual_cost_present: orders.filter(o => o.economics.delivery_actual_cost !== null).length,
+      outside_mkad_surcharge_present: orders.filter(o => o.economics.outside_mkad_surcharge.value !== null).length,
+      commission_total_present: orders.filter(o => o.economics.commission_total.value !== null).length,
+      return_total_present: orders.filter(o => o.economics.return_total.value !== null).length,
     },
     orders,
   };
@@ -561,6 +857,7 @@ export async function handleOrdersAnalytics(params: z.infer<typeof ordersAnalyti
     return ok({
       ...analyticsEnvelope(params.date_from, params.date_to, collected, "created_at", { max_pages: params.max_pages, max_orders: params.max_orders }),
       attribution_configured_keys: configuredAttributionKeys(guard.attribution),
+      economics_configured_keys: configuredEconomicsKeys(guard.economics),
     });
   });
 }
@@ -579,6 +876,7 @@ export async function handlePaidOrders(params: z.infer<typeof paidOrdersSchema>)
       ...analyticsEnvelope(params.date_from, params.date_to, { ...collected, orders: paidOnly }, "full_paid_at", { max_pages: params.max_pages, max_orders: params.max_orders }),
       paid_count: paidOnly.length,
       attribution_configured_keys: configuredAttributionKeys(guard.attribution),
+      economics_configured_keys: configuredEconomicsKeys(guard.economics),
     });
   });
 }
