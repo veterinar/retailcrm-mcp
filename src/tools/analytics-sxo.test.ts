@@ -8,7 +8,7 @@ import { handleOrdersHistory } from "./orders.js";
 import { mockBridge } from "../../tests/bridge-mock.js";
 
 const SECRET = "0123456789abcdef0123456789abcdef"; // 32 chars
-const ENV_KEYS = ["RETAILCRM_ANALYTICS_HMAC_SECRET", "RETAILCRM_ANALYTICS_ATTRIBUTION", "RETAILCRM_ANALYTICS_CHANNEL_MAP"] as const;
+const ENV_KEYS = ["RETAILCRM_ANALYTICS_HMAC_SECRET", "RETAILCRM_ANALYTICS_ATTRIBUTION", "RETAILCRM_ANALYTICS_CHANNEL_MAP", "RETAILCRM_ANALYTICS_ECONOMICS"] as const;
 
 beforeEach(() => {
   process.env.RETAILCRM_DOMAIN = "testshop.retailcrm.ru";
@@ -23,7 +23,7 @@ afterEach(() => {
 
 const paidStatusPage = { v: 1, ok: true, status: 200, data: { success: true, paymentStatuses: { paid: { code: "paid", paymentComplete: true }, pending: { code: "pending", paymentComplete: false } } } };
 
-const CTX = { secret: SECRET, attribution: { configured: false } as const, channelMap: {} as Record<string, never>, paidStatusCodes: new Set(["paid"]) };
+const CTX = { secret: SECRET, attribution: { configured: false } as const, economics: { configured: false } as const, channelMap: {} as Record<string, never>, paidStatusCodes: new Set(["paid"]) };
 
 describe("analytics-sxo join key", () => {
   it("is deterministic, follows the documented formula and basis precedence", () => {
@@ -84,7 +84,7 @@ describe("analytics-sxo projection", () => {
     const r = await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 });
     expect(r.isError).toBeFalsy();
     const text = r.text;
-    for (const banned of ["Ivan", "Petrov", "example.com", "+7 999", "+7999", "Secret Street", "manager secret", "customer secret", "status secret", "pay secret", "Dog Food", "CDEK", "01046MARK", "markingCode", "secret_note", "call me", "managerId", "\"customer\"", "\"firstName\"", "\"managerComment\"", "\"delivery\"", "\"phones\"", "\"email\""]) {
+    for (const banned of ["Ivan", "Petrov", "example.com", "+7 999", "+7999", "Secret Street", "manager secret", "customer secret", "status secret", "pay secret", "Dog Food", "CDEK", "01046MARK", "markingCode", "secret_note", "call me", "managerId", "\"customer\"", "\"firstName\"", "\"managerComment\"", "\"phones\"", "\"email\""]) {
       expect(text).not.toContain(banned);
     }
     // The native clientId VALUE is exposed only under its explicit renamed provenance
@@ -94,7 +94,22 @@ describe("analytics-sxo projection", () => {
     expect(parsed.complete).toBe(true);
     expect(parsed.count).toBe(1);
     expect(parsed.orders[0].attribution.client_id).toMatchObject({ value: "12345", field_code: "metrika_cid", source: "configured_custom_field" });
-    expect(parsed.orders[0].items[0]).toEqual({ sku: "SKU-1", quantity: 2, revenue: 900, vat_rate: "20%" });
+    // v2: item shape gains purchase_price/cogs/vat_status/cancelled ("20%" is NOT accepted 10/22 evidence)
+    expect(parsed.orders[0].items[0]).toEqual({ sku: "SKU-1", quantity: 2, revenue: 900, vat_rate: "20%", vat_status: "unexpected", purchase_price: null, cogs: null, cancelled: null });
+    // v2: the literal safe key `delivery` IS exposed — but ONLY as the exact safe projection
+    expect(parsed.orders[0].delivery).toEqual({ code: "courier", cost: 300, net_cost: null, vat_rate: null });
+    expect(JSON.stringify(parsed.orders[0].delivery)).not.toContain("address");
+    expect(JSON.stringify(parsed.orders[0].delivery)).not.toContain("service");
+    // v2: economics with nothing known — null, never zero, with explicit unconfigured reasons
+    expect(parsed.orders[0].economics).toEqual({
+      item_cogs_total: null,
+      delivery_actual_cost: null,
+      outside_mkad_surcharge: { value: null, field_code: null, source: "unconfigured", omitted_reason: "not_configured" },
+      commission_total: { value: null, field_code: null, source: "unconfigured", omitted_reason: "not_configured" },
+      return_total: { value: null, field_code: null, source: "unconfigured", omitted_reason: "not_configured" },
+      known_costs_total: null,
+      completeness: { item_cogs: false, item_vat: false, delivery_actual_cost: false, outside_mkad_surcharge: false, commission_total: false, return_total: false },
+    });
     expect(parsed.totals.revenue).toBe(1500);
   });
 
@@ -145,11 +160,11 @@ describe("analytics-sxo projection", () => {
     // Multi-tranche prices: sum EVERY price*quantity — never prices[0] alone.
     const multi = mk([{ offer: { externalId: "EXT-SKU", xmlId: "XML-1", article: "ART-1" }, quantity: 3, initialPrice: 500, prices: [{ price: 400, quantity: 1 }, { price: 350, quantity: 2 }] }]);
     if ("error" in multi) throw new Error("multi failed");
-    expect(multi.order.items[0]).toEqual({ sku: "EXT-SKU", quantity: 3, revenue: 1100, vat_rate: null }); // externalId wins SKU precedence
-    // No usable prices[]: (initialPrice - per-unit discountTotal) * quantity.
+    expect(multi.order.items[0]).toEqual({ sku: "EXT-SKU", quantity: 3, revenue: 1100, vat_rate: null, vat_status: "missing", purchase_price: null, cogs: null, cancelled: null }); // externalId wins SKU precedence
+    // No usable prices[]: initialPrice * quantity - discountTotal (line-total discount).
     const disc = mk([{ offer: { xmlId: "XML-2" }, quantity: 2, initialPrice: 500, discountTotal: 50 }]);
     if ("error" in disc) throw new Error("disc failed");
-    expect(disc.order.items[0]?.revenue).toBe(900);
+    expect(disc.order.items[0]?.revenue).toBe(950);
     // vatRate is a STRING in the current OpenAPI (e.g. "20%"); never coerced.
     const vat = mk([{ offer: { article: "ART-3" }, quantity: 1, initialPrice: 100, vatRate: "20%" }]);
     if ("error" in vat) throw new Error("vat failed");
@@ -654,5 +669,323 @@ describe("legacy orders_history: raw/default semantics (criterion 11)", () => {
     const params = bridge.first()?.params ?? {};
     expect(params["filter[sinceId]"]).toBe("12");
     expect("page" in params).toBe(false);
+  });
+});
+
+describe("analytics-sxo v2 economics and channels", () => {
+  it("covers all six canonical channel values and the namespaced precedence order", async () => {
+    // One order per source; namespaced keys are preferred over legacy and the
+    // source order order_method > site > source > delivery is enforced.
+    process.env.RETAILCRM_ANALYTICS_CHANNEL_MAP = JSON.stringify({
+      "order_method:chat-bot": "chat",
+      "site:ozon-storefront": "ozon",
+      "source:avito": "marketplace", // LEGACY input alias — must normalize to other_marketplace, never emitted
+      "delivery:cdek": "site",
+      "order_method:ignored-later": "site", // never reached: orderMethod checked before site
+      "phone-in": "phone",                   // legacy bare code still accepted
+      "site:x": "site",
+    });
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200,
+        data: {
+          success: true,
+          orders: [
+            { id: 1, orderMethod: "chat-bot", site: "x", source: { source: "avito" }, delivery: { code: "cdek" }, items: [] },
+            { id: 2, site: "ozon-storefront", source: { source: "avito" }, delivery: { code: "cdek" }, items: [] },
+            { id: 3, source: "avito", delivery: { code: "cdek" }, items: [] }, // string native source
+            { id: 4, delivery: { code: "cdek" }, items: [] },
+            { id: 5, orderMethod: "phone-in", items: [] },
+            { id: 6, orderMethod: "mystery", items: [] },
+          ],
+          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 6 },
+        },
+      };
+    });
+    const parsed = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 })).text);
+    const chans = parsed.orders.map((o: { channel: { value: string; basis: string } }) => o.channel);
+    expect(chans).toEqual([
+      { value: "chat", basis: "order_method" },           // namespaced order_method wins over every later source
+      { value: "ozon", basis: "site" },                   // then site:…
+      { value: "other_marketplace", basis: "source" },    // then native source code (legacy input alias marketplace, canonical output)
+      { value: "site", basis: "delivery" },               // then delivery code
+      { value: "phone", basis: "order_method" },          // legacy bare code on orderMethod
+      { value: "unknown", basis: "unmapped" },            // nothing matches: unknown, never guessed
+    ]);
+    expect(parsed.channel_completeness).toEqual({ mapped: 5, unknown: 1 });
+  });
+
+  it("malformed item entries (null/undefined/primitive/array) project fail-closed safe items without throwing", () => {
+    const r = projectOrder({
+      id: 1,
+      items: [
+        null,
+        undefined,
+        "primitive-item",
+        42,
+        ["array-entry"],
+        { offer: { xmlId: "OK-1" }, quantity: 1, initialPrice: 100 },
+      ] as unknown as never,
+    }, CTX);
+    expect(r).not.toHaveProperty("error");
+    if ("error" in r) throw new Error("projection failed");
+    // Every malformed entry becomes ONE safe item: all evidence null except vat_status.
+    const safe = { sku: null, quantity: null, revenue: null, vat_rate: null, vat_status: "missing", purchase_price: null, cogs: null, cancelled: null };
+    expect(r.order.items[0]).toEqual(safe);
+    expect(r.order.items[1]).toEqual(safe);
+    expect(r.order.items[2]).toEqual(safe);
+    expect(r.order.items[3]).toEqual(safe);
+    expect(r.order.items[4]).toEqual(safe);
+    // The one valid item still projects normally (fallback revenue 100*1).
+    expect(r.order.items[5]).toMatchObject({ sku: "OK-1", quantity: 1, revenue: 100 });
+    // A malformed item poisons item-level COGS/VAT completeness.
+    expect(r.order.economics.item_cogs_total).toBeNull();
+    expect(r.order.economics.completeness.item_cogs).toBe(false);
+    expect(r.order.economics.completeness.item_vat).toBe(false);
+  });
+
+  it("negative/malformed price tranches and negative fallback inputs yield revenue null; a valid fallback keeps its exact result", () => {
+    const mk = (items: unknown[]) => projectOrder({ id: 1, items: items as never }, CTX);
+    // Negative tranche price invalidates the WHOLE prices path; the genuine
+    // fallback inputs (finite non-negative) still yield their exact result.
+    const negPrice = mk([{ quantity: 2, initialPrice: 500, prices: [{ price: 400, quantity: 1 }, { price: -50, quantity: 1 }] }]);
+    if ("error" in negPrice) throw new Error("negPrice failed");
+    expect(negPrice.order.items[0]?.revenue).toBe(1000); // valid fallback: 500*2 - 0
+    // Malformed (null) tranche entry invalidates the prices path; no usable fallback => null.
+    const nullTranche = mk([{ quantity: 1, prices: [{ price: 10, quantity: 1 }, null] }]);
+    if ("error" in nullTranche) throw new Error("nullTranche failed");
+    expect(nullTranche.order.items[0]?.revenue).toBeNull();
+    // Negative quantity: not evidence — the fallback can never run => null.
+    const negQty = mk([{ quantity: -2, initialPrice: 500 }]);
+    if ("error" in negQty) throw new Error("negQty failed");
+    expect(negQty.order.items[0]?.revenue).toBeNull();
+    // Negative discountTotal rejects the fallback => null.
+    const negDisc = mk([{ quantity: 2, initialPrice: 500, discountTotal: -10 }]);
+    if ("error" in negDisc) throw new Error("negDisc failed");
+    expect(negDisc.order.items[0]?.revenue).toBeNull();
+    // Discount exceeding the line (negative result) => null, never clamped to zero.
+    const overDisc = mk([{ quantity: 1, initialPrice: 100, discountTotal: 150 }]);
+    if ("error" in overDisc) throw new Error("overDisc failed");
+    expect(overDisc.order.items[0]?.revenue).toBeNull();
+    // A genuine non-negative fallback keeps its exact expected value.
+    const ok = mk([{ quantity: 3, initialPrice: 400, discountTotal: 50 }]);
+    if ("error" in ok) throw new Error("ok failed");
+    expect(ok.order.items[0]?.revenue).toBe(1150);
+  });
+
+  it("fails closed on malformed economics config before any bridge call", async () => {
+    for (const bad of [
+      "{not json",                                                        // malformed JSON
+      "[1,2]",                                                            // not an object
+      JSON.stringify({ surprise_key: "some_field" }),                     // unknown key
+      JSON.stringify({ outside_mkad_surcharge: "a", commission_total: "a" }), // duplicate code
+      JSON.stringify({ return_total: "  " }),                             // unsafe (empty) code
+    ]) {
+      process.env.RETAILCRM_ANALYTICS_ECONOMICS = bad;
+      const bridge = mockBridge([]);
+      const r = await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 });
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain("RETAILCRM_ANALYTICS_ECONOMICS");
+      expect(bridge.calls.length).toBe(0); // fail closed BEFORE any provider call
+    }
+  });
+
+  it("extracts only finite non-negative configured economics numbers; never coerces strings", async () => {
+    process.env.RETAILCRM_ANALYTICS_ECONOMICS = JSON.stringify({
+      outside_mkad_surcharge: "mkad_fee",
+      commission_total: "ozon_commission",
+      return_total: "return_amount",
+    });
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200,
+        data: {
+          success: true,
+          orders: [{
+            id: 1,
+            items: [{ offer: { xmlId: "SKU-A" }, quantity: 2, purchasePrice: 100.125, vatRate: "22%" }],
+            customFields: { mkad_fee: 500, ozon_commission: "250.50", return_amount: -1, some_other: "never-extract" },
+          }],
+          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 1 },
+        },
+      };
+    });
+    const parsed = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 })).text);
+    expect(parsed.economics_configured_keys).toEqual(["commission_total", "outside_mkad_surcharge", "return_total"]);
+    const eco = parsed.orders[0].economics;
+    expect(eco.outside_mkad_surcharge).toEqual({ value: 500, field_code: "mkad_fee", source: "configured_custom_field", omitted_reason: null });
+    // Strings are NEVER coerced; negatives rejected — both with explicit reasons.
+    expect(eco.commission_total).toEqual({ value: null, field_code: "ozon_commission", source: "configured_custom_field", omitted_reason: "not_a_finite_non_negative_number" });
+    expect(eco.return_total).toEqual({ value: null, field_code: "return_amount", source: "configured_custom_field", omitted_reason: "not_a_finite_non_negative_number" });
+    expect(JSON.stringify(parsed)).not.toContain("never-extract"); // no arbitrary fields
+    // item cogs = round2(100.125 * 2) = 200.25; known total sums ONLY known components: 200.25 + 500.
+    expect(eco.item_cogs_total).toBe(200.25);
+    expect(eco.known_costs_total).toBe(700.25);
+    expect(eco.completeness).toEqual({ item_cogs: true, item_vat: true, delivery_actual_cost: false, outside_mkad_surcharge: true, commission_total: false, return_total: false });
+    expect(parsed.orders[0].items[0]).toMatchObject({ cogs: 200.25, purchase_price: 100.125, vat_status: "accepted_10_22", cancelled: null });
+  });
+
+  it("COGS/VAT/completeness: zero items and null cogs stay null — never zero", async () => {
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200,
+        data: {
+          success: true,
+          orders: [
+            // Zero items: item_cogs_total is NULL, not 0; item_vat completeness false.
+            { id: 1, items: [] },
+            // One item with cogs, one without (missing purchasePrice): whole total null.
+            { id: 2, items: [{ offer: { xmlId: "A" }, quantity: 1, purchasePrice: 50, vatRate: "VAT22" }, { offer: { xmlId: "B" }, quantity: 1 }] },
+            // Negative purchasePrice: cogs null; "10.5%" is unexpected (non-zero decimals).
+            { id: 3, items: [{ offer: { xmlId: "C" }, quantity: 1, purchasePrice: -5, vatRate: "10.5%", isCanceled: true }] },
+            // Negative quantity with a valid purchasePrice: cogs null (never a negative COGS).
+            { id: 4, items: [{ offer: { xmlId: "E" }, quantity: -2, purchasePrice: 50 }] },
+          ],
+          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 4 },
+        },
+      };
+    });
+    const parsed = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 })).text);
+    expect(parsed.orders[0].economics.item_cogs_total).toBeNull();
+    expect(parsed.orders[0].economics.completeness.item_cogs).toBe(false);
+    expect(parsed.orders[0].economics.completeness.item_vat).toBe(false); // empty item list is NOT complete
+    expect(parsed.orders[1].economics.item_cogs_total).toBeNull(); // one unknown cogs poisons the total
+    expect(parsed.orders[1].economics.completeness.item_cogs).toBe(false);
+    expect(parsed.orders[1].economics.completeness.item_vat).toBe(false); // one item unexpected ("missing")
+    expect(parsed.orders[2].items[0].cogs).toBeNull(); // negative purchasePrice => null
+    expect(parsed.orders[2].items[0].vat_status).toBe("unexpected"); // "10.5%" has non-zero decimals
+    expect(parsed.orders[2].items[0].cancelled).toBe(true);
+    // Negative quantity with a valid purchasePrice: cogs null, never negative COGS.
+    expect(parsed.orders[3].items[0].cogs).toBeNull();
+    expect(parsed.orders[3].economics.item_cogs_total).toBeNull();
+    expect(parsed.orders[3].economics.completeness.item_cogs).toBe(false);
+    // Envelope counts reflect true presence only.
+    expect(parsed.economics_completeness).toEqual({
+      order_count: 4,
+      complete_item_cogs: 0,
+      accepted_item_vat: 0,
+      delivery_actual_cost_present: 0,
+      outside_mkad_surcharge_present: 0,
+      commission_total_present: 0,
+      return_total_present: 0,
+    });
+  });
+
+  it("safe delivery projection keeps only {code,cost,net_cost,vat_rate}; non-object delivery is null", async () => {
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200,
+        data: {
+          success: true,
+          orders: [
+            {
+              id: 1,
+              delivery: { code: "cdek", cost: "300", netCost: 250.5, vatRate: "20%", address: { text: "Secret Street 9" }, service: { name: "CDEK" } },
+              items: [{ offer: { xmlId: "D" }, quantity: 1, purchasePrice: 100 }],
+            },
+            { id: 2, delivery: "courier", items: [] }, // non-object delivery
+            { id: 3, delivery: null, items: [] },      // absent delivery
+          ],
+          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 3 },
+        },
+      };
+    });
+    const parsed = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 })).text);
+    expect(parsed.orders[0].delivery).toEqual({ code: "cdek", cost: null, net_cost: 250.5, vat_rate: "20%" }); // non-numeric cost => null
+    expect(parsed.orders[0].economics.delivery_actual_cost).toBe(250.5); // net_cost is the actual-cost evidence
+    expect(parsed.orders[1].delivery).toBeNull();
+    expect(parsed.orders[2].delivery).toBeNull();
+    expect(JSON.stringify(parsed)).not.toContain("Secret Street");
+    expect(JSON.stringify(parsed)).not.toContain("CDEK");
+  });
+
+  it("publication evidence: a partial window is non-publishable; a traversed result is complete and publishable", async () => {
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      const page = Number(req.params?.page ?? "1");
+      return {
+        v: 1, ok: true, status: 200,
+        data: {
+          success: true,
+          orders: [{ id: page, totalSumm: 100 }],
+          pagination: { currentPage: page, totalPageCount: 3, totalCount: 3 },
+        },
+      };
+    });
+    const partial = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 2, max_orders: 10_000 })).text);
+    expect(partial.complete).toBe(false);
+    expect(partial.publication_status).toBe("partial");
+    expect(partial.publishable).toBe(false);
+    expect(partial.pages_fetched).toBe(2);
+    expect(partial.totals.revenue).toBe(200);        // bounded observed subtotal kept for diagnosis
+    expect(partial.totals.revenue_scope).toBe("partial_window");
+    expect(partial.totals.publishable).toBe(false);  // ...but never publishable
+    const complete = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-08-01", date_to: "2026-08-31", max_pages: 10, max_orders: 10_000 })).text);
+    expect(complete.complete).toBe(true);
+    expect(complete.publication_status).toBe("complete");
+    expect(complete.publishable).toBe(true);
+    expect(complete.pages_fetched).toBe(3);
+    expect(complete.totals.revenue_scope).toBe("complete");
+    expect(complete.totals.publishable).toBe(true);
+    // Complete traversal but EVERY order total is missing: traversal status
+    // stays "complete", yet amounts fail closed — revenue/AOV null, not zero.
+    const bridge2 = mockBridge([]);
+    bridge2.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      const page = Number(req.params?.page ?? "1");
+      return {
+        v: 1, ok: true, status: 200,
+        data: {
+          success: true,
+          orders: [{ id: page }], // no totalSumm => projected total is null
+          pagination: { currentPage: page, totalPageCount: 3, totalCount: 3 },
+        },
+      };
+    });
+    const incompleteValues = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-09-01", date_to: "2026-09-30", max_pages: 10, max_orders: 10_000 })).text);
+    expect(incompleteValues.complete).toBe(true);
+    expect(incompleteValues.publication_status).toBe("complete");
+    expect(incompleteValues.publishable).toBe(false);
+    expect(incompleteValues.totals.publishable).toBe(false);
+    expect(incompleteValues.totals.revenue).toBeNull();
+    expect(incompleteValues.totals.average_order_value).toBeNull();
+    expect(incompleteValues.totals.revenue_scope).toBe("incomplete_values");
+    expect(incompleteValues.total_amount_completeness).toEqual({ present: 0, missing: 3 });
+    // Same fail-closed contract for MALFORMED totals: negative, NaN and Infinity
+    // totalSumm each project as null and keep the completed traversal
+    // non-publishable with incomplete_values — never coerced to a number.
+    const bridge3 = mockBridge([]);
+    bridge3.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      const page = Number(req.params?.page ?? "1");
+      const malformedTotals = [-50, Number.NaN, Number.POSITIVE_INFINITY];
+      return {
+        v: 1, ok: true, status: 200,
+        data: {
+          success: true,
+          orders: [{ id: page, totalSumm: malformedTotals[page - 1] }],
+          pagination: { currentPage: page, totalPageCount: 3, totalCount: 3 },
+        },
+      };
+    });
+    const malformedTotals = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-10-01", date_to: "2026-10-31", max_pages: 10, max_orders: 10_000 })).text);
+    expect(malformedTotals.orders.map((o: { total: number | null }) => o.total)).toEqual([null, null, null]);
+    expect(malformedTotals.complete).toBe(true);
+    expect(malformedTotals.publication_status).toBe("complete");
+    expect(malformedTotals.publishable).toBe(false);
+    expect(malformedTotals.totals.publishable).toBe(false);
+    expect(malformedTotals.totals.revenue).toBeNull();
+    expect(malformedTotals.totals.average_order_value).toBeNull();
+    expect(malformedTotals.totals.revenue_scope).toBe("incomplete_values");
+    expect(malformedTotals.total_amount_completeness).toEqual({ present: 0, missing: 3 });
   });
 });
