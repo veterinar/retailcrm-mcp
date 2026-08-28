@@ -365,6 +365,102 @@ export async function fetchPaidStatusCodes(): Promise<Set<string>> {
   return paid;
 }
 
+// ── Order lifecycle reference (v5 commercial lifecycle) ──────
+
+// Exact status-code → provider group map from /reference/statuses. The
+// provider group is the ONLY cancellation evidence; display text, delivery,
+// payment state, order method, source and item isCanceled never participate.
+export type CrmStatusGroupMap = ReadonlyMap<string, string>;
+
+/**
+ * Strict fail-closed parser for /reference/statuses: accepts only an object
+ * map of status entries whose `group` is a non-empty string. Malformed
+ * containers or entries throw a bounded error before any analytics is
+ * published. A response with no `statuses` container at all yields an empty
+ * map — classification then fails closed per order to UNKNOWN.
+ */
+export async function fetchStatusGroups(): Promise<CrmStatusGroupMap> {
+  const resp = await retailCrmGet("/reference/statuses") as { statuses?: unknown };
+  const map = resp?.statuses;
+  if (map === undefined) return new Map<string, string>();
+  if (map === null || typeof map !== "object" || Array.isArray(map)) {
+    throw new Error("RetailCRM order statuses response is malformed (expected statuses object)");
+  }
+  const groups = new Map<string, string>();
+  for (const [code, entry] of Object.entries(map as Record<string, unknown>)) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`RetailCRM order status "${code}" is malformed`);
+    }
+    const group = (entry as { group?: unknown }).group;
+    if (typeof group !== "string" || group.trim() === "") {
+      throw new Error(`RetailCRM order status "${code}" has a malformed group (expected non-empty string)`);
+    }
+    groups.set(code, group);
+  }
+  return groups;
+}
+
+// ── Commercial lifecycle classification (v5) ─────────────────
+
+export type LifecycleClass = "INCLUDED" | "CANCELLED" | "RETURNED" | "UNKNOWN";
+
+export type OrderLifecycle = {
+  class: LifecycleClass;
+  commercial_included: boolean;
+  status_code: string | null;
+  status_group: string | null;
+  basis: string;
+  omitted_reason: string | null;
+};
+
+/**
+ * Lifecycle precedence (docs/criteria/retailcrm-commercial-lifecycle-v5.md):
+ * RETURNED only for an exact configured economics.return_total numeric value
+ * > 0; CANCELLED only when the exact provider status map says group "cancel";
+ * INCLUDED for a mapped non-cancel group; UNKNOWN for a missing, non-string
+ * or unmapped status (fail closed, commercial_included=false). No raw value
+ * beyond the already-allowlisted order status is ever exposed.
+ */
+export function buildLifecycle(
+  statusCode: string | null,
+  statusGroup: string | undefined,
+  returnTotalValue: number | null,
+): OrderLifecycle {
+  if (returnTotalValue !== null && returnTotalValue > 0) {
+    return {
+      class: "RETURNED", commercial_included: false,
+      status_code: statusCode, status_group: statusGroup ?? null,
+      basis: "economics.return_total>0", omitted_reason: "returned_excluded_from_commercial_result",
+    };
+  }
+  if (statusCode === null) {
+    return {
+      class: "UNKNOWN", commercial_included: false,
+      status_code: null, status_group: null,
+      basis: "order.status", omitted_reason: "status_missing_or_not_a_string",
+    };
+  }
+  if (statusGroup === undefined) {
+    return {
+      class: "UNKNOWN", commercial_included: false,
+      status_code: statusCode, status_group: null,
+      basis: "reference.statuses", omitted_reason: "status_not_in_reference_map",
+    };
+  }
+  if (statusGroup === "cancel") {
+    return {
+      class: "CANCELLED", commercial_included: false,
+      status_code: statusCode, status_group: statusGroup,
+      basis: "reference.statuses:group_cancel", omitted_reason: "cancelled_excluded_from_commercial_result",
+    };
+  }
+  return {
+    class: "INCLUDED", commercial_included: true,
+    status_code: statusCode, status_group: statusGroup,
+    basis: "reference.statuses:group_non_cancel", omitted_reason: null,
+  };
+}
+
 // ── PII-free projection ──────────────────────────────────────
 
 /** Item VAT evidence: only unambiguous exactly-10%/22% representations are accepted. */
@@ -516,11 +612,14 @@ export type AnalyticsOrder = {
   sales_channel: SalesChannelView;
   channel: { value: Channel; basis: ChannelBasis };
   economics: OrderEconomics;
+  lifecycle: OrderLifecycle;
   payment_evidence: PaymentEvidence;
   join_key: string | null;
 };
 
-type ProjectionCtx = AnalyticsGuard & { paidStatusCodes: Set<string> };
+// statusGroups is optional for legacy direct projectOrder callers: an absent
+// map classifies fail-closed to UNKNOWN (never a guessed lifecycle).
+type ProjectionCtx = AnalyticsGuard & { paidStatusCodes: Set<string>; statusGroups?: CrmStatusGroupMap };
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
@@ -680,6 +779,13 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
   const delivery = projectDelivery(o.delivery);
   const salesChannel = extractSalesChannel(o);
   const economics = buildEconomics(items, delivery, o.customFields, ctx.economics);
+  // Commercial lifecycle (v5): classification uses ONLY the exact provider
+  // status map plus the explicitly configured return_total numeric evidence —
+  // never display text, delivery, payment state, order method, source or item
+  // isCanceled.
+  const statusCode = typeof o.status === "string" && o.status !== "" ? o.status : null;
+  const statusGroup = statusCode !== null ? ctx.statusGroups?.get(statusCode) : undefined;
+  const lifecycle = buildLifecycle(statusCode, statusGroup, economics.return_total.value);
   return {
     order: {
       id: o.id,
@@ -702,6 +808,7 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
       sales_channel: salesChannel,
       channel: deriveChannel(salesChannel),
       economics,
+      lifecycle,
       payment_evidence: paymentEvidence,
       join_key: orderJoinKey(o, ctx.secret),
     },
@@ -878,6 +985,38 @@ function analyticsEnvelope(
       crm_paid_amount_present: orders.filter(o => o.payment_evidence.crm_paid_amount !== null).length,
       amount_matches_present: orders.filter(o => o.payment_evidence.amount_matches !== null).length,
     },
+    // Commercial result (v5): the ONLY revenue-ready surface. It excludes
+    // CANCELLED, RETURNED and UNKNOWN orders from counts/revenue; the
+    // returned amount is a separate exact figure, never subtracted from
+    // revenue and never a contribution-profit claim.
+    commercial_result: (() => {
+      const includedOrders = orders.filter(o => o.lifecycle.class === "INCLUDED");
+      const cancelledCount = orders.filter(o => o.lifecycle.class === "CANCELLED").length;
+      const returnedOrders = orders.filter(o => o.lifecycle.class === "RETURNED");
+      const unknownCount = orders.filter(o => o.lifecycle.class === "UNKNOWN").length;
+      const includedTotalsMissing = includedOrders.filter(o => o.total === null).length;
+      const allIncludedTotalsPresent = includedTotalsMissing === 0;
+      const includedRevenue = allIncludedTotalsPresent
+        ? round2(includedOrders.reduce((sum, o) => sum + (o.total ?? 0), 0))
+        : null;
+      // Returned amount is exact only when every RETURNED order's return
+      // evidence is known; missing amounts are never zero.
+      const allReturnedKnown = returnedOrders.every(o => o.economics.return_total.value !== null);
+      const returnedAmount = allReturnedKnown
+        ? round2(returnedOrders.reduce((sum, o) => sum + (o.economics.return_total.value ?? 0), 0))
+        : null;
+      return {
+        counts: { included: includedOrders.length, cancelled: cancelledCount, returned: returnedOrders.length, unknown: unknownCount },
+        included_revenue: includedRevenue,
+        returned_amount: returnedAmount,
+        amount_completeness: {
+          included_totals_present: includedOrders.length - includedTotalsMissing,
+          included_totals_missing: includedTotalsMissing,
+          returned_amount_known: allReturnedKnown,
+        },
+        publishable: c.complete && unknownCount === 0 && allIncludedTotalsPresent,
+      };
+    })(),
     economics_completeness: {
       order_count: orders.length,
       // Presence counts only — a missing component is never counted as zero.
@@ -963,7 +1102,7 @@ export async function handleOrdersAnalytics(params: z.infer<typeof ordersAnalyti
   return runTool(async () => {
     const guard = guardConfig();
     if ("error" in guard) return fail(guard.error);
-    const ctx: ProjectionCtx = { ...guard, paidStatusCodes: await fetchPaidStatusCodes() };
+    const ctx: ProjectionCtx = { ...guard, paidStatusCodes: await fetchPaidStatusCodes(), statusGroups: await fetchStatusGroups() };
     // Window basis: order CREATION time (filter[createdAtFrom]/[To]).
     const collected = await collectAnalyticsOrders(params.date_from, params.date_to, params.max_pages, params.max_orders, ctx, "created_at");
     return ok({
@@ -978,7 +1117,7 @@ export async function handlePaidOrders(params: z.infer<typeof paidOrdersSchema>)
   return runTool(async () => {
     const guard = guardConfig();
     if ("error" in guard) return fail(guard.error);
-    const ctx: ProjectionCtx = { ...guard, paidStatusCodes: await fetchPaidStatusCodes() };
+    const ctx: ProjectionCtx = { ...guard, paidStatusCodes: await fetchPaidStatusCodes(), statusGroups: await fetchStatusGroups() };
     // Window basis: FULL-PAID time (filter[fullPaidAtFrom]/[To]) — the tool's
     // business output is paid revenue, so the period selects when orders were
     // fully paid, not when they were created. date_basis says so in the output.
@@ -995,6 +1134,9 @@ export async function handlePaidOrders(params: z.infer<typeof paidOrdersSchema>)
     return ok({
       ...analyticsEnvelope(params.date_from, params.date_to, { ...collected, orders: paidOnly }, "full_paid_at", { max_pages: params.max_pages, max_orders: params.max_orders }),
       paid_count: paidOnly.length,
+      // Commercial cohort (v5): only INCLUDED rows count here — CANCELLED,
+      // RETURNED and UNKNOWN stay excluded from the commercial surface.
+      commercial_paid_count: paidOnly.filter(e => e.order.lifecycle.class === "INCLUDED").length,
       attribution_configured_keys: configuredAttributionKeys(guard.attribution),
       economics_configured_keys: configuredEconomicsKeys(guard.economics),
     });
@@ -1019,7 +1161,7 @@ export async function handleOrderAttribution(params: z.infer<typeof orderAttribu
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
       return fail("RetailCRM order response is malformed (order object missing)");
     }
-    const projected = projectOrder(raw as AsxOrderRaw, { ...guard, paidStatusCodes });
+    const projected = projectOrder(raw as AsxOrderRaw, { ...guard, paidStatusCodes, statusGroups: await fetchStatusGroups() });
     if ("error" in projected) return fail(projected.error);
     return ok({
       generated_at: typeof resp.generatedAt === "string" ? resp.generatedAt : null,
