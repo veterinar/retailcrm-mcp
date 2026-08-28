@@ -23,7 +23,7 @@ afterEach(() => {
 
 const paidStatusPage = { v: 1, ok: true, status: 200, data: { success: true, paymentStatuses: { paid: { code: "paid", paymentComplete: true }, pending: { code: "pending", paymentComplete: false } } } };
 
-const CTX = { secret: SECRET, attribution: { configured: false } as const, economics: { configured: false } as const, channelMap: {} as Record<string, never>, paidStatusCodes: new Set(["paid"]) };
+const CTX = { secret: SECRET, attribution: { configured: false } as const, economics: { configured: false } as const, paidStatusCodes: new Set(["paid"]) };
 
 describe("analytics-sxo join key", () => {
   it("is deterministic, follows the documented formula and basis precedence", () => {
@@ -396,7 +396,6 @@ describe("analytics-sxo pagination", () => {
 describe("analytics-sxo attribution and channels", () => {
   it("extracts only configured tokens; unconfigured keys carry explicit omission reasons", async () => {
     process.env.RETAILCRM_ANALYTICS_ATTRIBUTION = JSON.stringify({ client_id: "metrika_cid", yclid: "yandex_click" });
-    process.env.RETAILCRM_ANALYTICS_CHANNEL_MAP = JSON.stringify({ "phone-in": "phone", "site-b": "site" });
     const bridge = mockBridge([]);
     bridge.implement(req => {
       if (req.path === "/reference/payment-statuses") return paidStatusPage;
@@ -421,12 +420,14 @@ describe("analytics-sxo attribution and channels", () => {
     expect(parsed.order.attribution.yclid).toMatchObject({ value: null, omitted_reason: "empty" });
     expect(parsed.order.attribution.utm_source).toMatchObject({ value: null, source: "unconfigured", omitted_reason: "not_configured" });
     expect(r.text).not.toContain("never-extract-me"); // no guessed custom-field codes
-    expect(parsed.order.channel).toEqual({ value: "phone", basis: "order_method" }); // orderMethod wins over site
+    // No customFields.sales_channel on the order: legacy channel has no
+    // delivery/orderMethod/site fallback — orderMethod "phone-in" cannot rescue it.
+    expect(parsed.order.sales_channel).toEqual({ value: "UNKNOWN", field_code: "sales_channel", source: "order.customFields", omitted_reason: "field_absent_on_order" });
+    expect(parsed.order.channel).toEqual({ value: "unknown", basis: "unmapped" });
     expect(parsed.order.retailcrm_client_id_source).toBe("retailcrm_native_clientId");
   });
 
   it("classifies unmapped codes as unknown and reports completeness", async () => {
-    process.env.RETAILCRM_ANALYTICS_CHANNEL_MAP = JSON.stringify({ "site-b": "site" });
     const bridge = mockBridge([]);
     bridge.implement(req => {
       if (req.path === "/reference/payment-statuses") return paidStatusPage;
@@ -442,9 +443,52 @@ describe("analytics-sxo attribution and channels", () => {
       };
     });
     const parsed = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 })).text);
-    expect(parsed.orders[0].channel).toEqual({ value: "site", basis: "site" });
+    // site "site-b" is no longer channel evidence: with no sales_channel both orders are unmapped.
+    expect(parsed.orders[0].sales_channel).toEqual({ value: "UNKNOWN", field_code: "sales_channel", source: "order.customFields", omitted_reason: "field_absent_on_order" });
+    expect(parsed.orders[0].channel).toEqual({ value: "unknown", basis: "unmapped" });
     expect(parsed.orders[1].channel).toEqual({ value: "unknown", basis: "unmapped" });
-    expect(parsed.channel_completeness).toEqual({ mapped: 1, unknown: 1 });
+    expect(parsed.channel_completeness).toEqual({ mapped: 0, unknown: 2 });
+    expect(parsed.sales_channel_completeness).toEqual({ mapped: 0, unknown: 2 });
+  });
+
+  // PROTECTION TEST — required RED on base a33f7587f9e0302aae1dfd23148e6ce9638ad163:
+  // the authoritative sales_channel projection is absent there and delivery still
+  // influences legacy classification.
+  it("sales_channel is authoritative: absent customFields.sales_channel => UNKNOWN even with conflicting legacy delivery/site/orderMethod signals", async () => {
+    // No channel map configured: legacy signals are conflicting noise and must
+    // not rescue the classification. delivery.code is fulfillment evidence only.
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200,
+        data: {
+          success: true,
+          orders: [{
+            id: 1,
+            delivery: { code: "ozon-seller" },
+            site: "ozon-storefront",
+            orderMethod: "chat-bot",
+            source: { source: "ozon" },
+            customFields: { metrika_cid: "12345" }, // no own sales_channel
+            items: [],
+          }],
+          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 1 },
+        },
+      };
+    });
+    const parsed = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 })).text);
+    // Authoritative projection: UNKNOWN read only from order.customFields.sales_channel.
+    expect(parsed.orders[0].sales_channel).toEqual({
+      value: "UNKNOWN",
+      field_code: "sales_channel",
+      source: "order.customFields",
+      omitted_reason: "field_absent_on_order",
+    });
+    // Legacy compatibility field: derived from the authoritative value, no delivery fallback.
+    expect(parsed.orders[0].channel).toEqual({ value: "unknown", basis: "unmapped" });
+    // Envelope completeness counts authoritative values only.
+    expect(parsed.sales_channel_completeness).toEqual({ mapped: 0, unknown: 1 });
   });
 
   it("rejects bad attribution config instead of guessing", async () => {
@@ -814,18 +858,11 @@ describe("legacy orders_history: raw/default semantics (criterion 11)", () => {
 });
 
 describe("analytics-sxo v2 economics and channels", () => {
-  it("covers all six canonical channel values and the namespaced precedence order", async () => {
-    // One order per source; namespaced keys are preferred over legacy and the
-    // source order order_method > site > source > delivery is enforced.
-    process.env.RETAILCRM_ANALYTICS_CHANNEL_MAP = JSON.stringify({
-      "order_method:chat-bot": "chat",
-      "site:ozon-storefront": "ozon",
-      "source:avito": "marketplace", // LEGACY input alias — must normalize to other_marketplace, never emitted
-      "delivery:cdek": "site",
-      "order_method:ignored-later": "site", // never reached: orderMethod checked before site
-      "phone-in": "phone",                   // legacy bare code still accepted
-      "site:x": "site",
-    });
+  it("covers all six canonical sales_channel values with lowercase/uppercase normalization, legacy derivation and completeness", async () => {
+    // One order per canonical value; deployed lowercase codes and canonical
+    // uppercase spellings must normalize to the same canonical output.
+    // Conflicting legacy delivery/site/orderMethod/source signals are noise
+    // and never influence the authoritative result.
     const bridge = mockBridge([]);
     bridge.implement(req => {
       if (req.path === "/reference/payment-statuses") return paidStatusPage;
@@ -834,28 +871,109 @@ describe("analytics-sxo v2 economics and channels", () => {
         data: {
           success: true,
           orders: [
-            { id: 1, orderMethod: "chat-bot", site: "x", source: { source: "avito" }, delivery: { code: "cdek" }, items: [] },
-            { id: 2, site: "ozon-storefront", source: { source: "avito" }, delivery: { code: "cdek" }, items: [] },
-            { id: 3, source: "avito", delivery: { code: "cdek" }, items: [] }, // string native source
-            { id: 4, delivery: { code: "cdek" }, items: [] },
-            { id: 5, orderMethod: "phone-in", items: [] },
-            { id: 6, orderMethod: "mystery", items: [] },
+            { id: 1, customFields: { sales_channel: "petdog_ru" }, delivery: { code: "ozon-seller" }, site: "ozon-storefront", items: [] },
+            { id: 2, customFields: { sales_channel: "OZON" }, orderMethod: "chat-bot", items: [] },
+            { id: 3, customFields: { sales_channel: "OTHER_MARKETPLACE" }, source: { source: "petdog" }, items: [] },
+            { id: 4, customFields: { sales_channel: "b2b" }, site: "petdog-shop", items: [] },
+            { id: 5, customFields: { sales_channel: "B2G" }, delivery: { code: "cdek" }, items: [] },
+            { id: 6, items: [] }, // no sales_channel at all
           ],
           pagination: { currentPage: 1, totalPageCount: 1, totalCount: 6 },
         },
       };
     });
     const parsed = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 })).text);
+    const sales = parsed.orders.map((o: { sales_channel: { value: string; omitted_reason: string | null } }) => [o.sales_channel.value, o.sales_channel.omitted_reason]);
+    expect(sales).toEqual([
+      ["PETDOG_RU", null],       // deployed lowercase dictionary code
+      ["OZON", null],            // canonical uppercase alias
+      ["OTHER_MARKETPLACE", null], // canonical uppercase alias
+      ["B2B", null],
+      ["B2G", null],
+      ["UNKNOWN", "field_absent_on_order"], // absent field fails closed
+    ]);
+    // Legacy compatibility derivation (B2B/B2G have no legacy representation).
     const chans = parsed.orders.map((o: { channel: { value: string; basis: string } }) => o.channel);
     expect(chans).toEqual([
-      { value: "chat", basis: "order_method" },           // namespaced order_method wins over every later source
-      { value: "ozon", basis: "site" },                   // then site:…
-      { value: "other_marketplace", basis: "source" },    // then native source code (legacy input alias marketplace, canonical output)
-      { value: "site", basis: "delivery" },               // then delivery code
-      { value: "phone", basis: "order_method" },          // legacy bare code on orderMethod
-      { value: "unknown", basis: "unmapped" },            // nothing matches: unknown, never guessed
+      { value: "site", basis: "sales_channel" },             // PETDOG_RU -> site
+      { value: "ozon", basis: "sales_channel" },             // OZON -> ozon
+      { value: "other_marketplace", basis: "sales_channel" },// OTHER_MARKETPLACE -> other_marketplace
+      { value: "unknown", basis: "sales_channel" },          // B2B -> legacy unknown
+      { value: "unknown", basis: "sales_channel" },          // B2G -> legacy unknown
+      { value: "unknown", basis: "unmapped" },               // no authoritative evidence
     ]);
+    // Completeness counts AUTHORITATIVE values: B2B/B2G are mapped even though
+    // the legacy taxonomy cannot represent them.
     expect(parsed.channel_completeness).toEqual({ mapped: 5, unknown: 1 });
+    expect(parsed.sales_channel_completeness).toEqual({ mapped: 5, unknown: 1 });
+  });
+
+  it("sales_channel fail-closed reasons: missing customFields, empty, non-string, unsupported; raw unsupported value never exposed", async () => {
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200,
+        data: {
+          success: true,
+          orders: [
+            { id: 1, items: [] },                                                // no customFields at all
+            { id: 2, customFields: { sales_channel: "   " }, items: [] },        // empty text
+            { id: 3, customFields: { sales_channel: 42 }, items: [] },           // non-string
+            { id: 4, customFields: { sales_channel: "wild-wild-west" }, items: [] }, // unsupported dictionary value
+            { id: 5, customFields: { sales_channel: ["ozon"] }, items: [] },     // non-string (array)
+            { id: 6, customFields: { sales_channel: "Other_Marketplace" }, items: [] }, // mixed case is not an exact accepted spelling
+            { id: 7, customFields: { sales_channel: " ozon " }, items: [] },     // surrounding whitespace is not an exact accepted spelling
+          ],
+          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 7 },
+        },
+      };
+    });
+    const r = await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 });
+    expect(r.isError).toBeFalsy();
+    const parsed = JSON.parse(r.text);
+    const reasons = parsed.orders.map((o: { sales_channel: { value: string; omitted_reason: string } }) => [o.sales_channel.value, o.sales_channel.omitted_reason]);
+    expect(reasons).toEqual([
+      ["UNKNOWN", "field_absent_on_order"],
+      ["UNKNOWN", "empty"],
+      ["UNKNOWN", "not_a_string"],
+      ["UNKNOWN", "unsupported_value"],
+      ["UNKNOWN", "not_a_string"],
+      ["UNKNOWN", "unsupported_value"],
+      ["UNKNOWN", "unsupported_value"],
+    ]);
+    for (const o of parsed.orders) expect(o.channel).toEqual({ value: "unknown", basis: "unmapped" });
+    // The raw unsupported value is never exposed anywhere in the output.
+    expect(r.text).not.toContain("wild-wild-west");
+    expect(parsed.channel_completeness).toEqual({ mapped: 0, unknown: 7 });
+    expect(parsed.sales_channel_completeness).toEqual({ mapped: 0, unknown: 7 });
+  });
+
+  it("inherited prototype properties never resolve as sales_channel; array customFields never yield a value", async () => {
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200,
+        data: {
+          success: true,
+          orders: [
+            // customFields whose PROTOTYPE carries sales_channel (not an own
+            // property): the inherited value must never be read.
+            { id: 1, items: [], customFields: (() => { const p = { sales_channel: "ozon" } as const; const o: Record<string, unknown> = { city: "Kazan" }; Object.setPrototypeOf(o, p); return o; })() },
+            // Array customFields container: not a non-array object — field_absent_on_order.
+            { id: 2, items: [], customFields: [{ sales_channel: "ozon" }] as unknown as Record<string, unknown> },
+          ],
+          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 2 },
+        },
+      };
+    });
+    const parsed = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 })).text);
+    for (const o of parsed.orders) {
+      expect(o.sales_channel).toEqual({ value: "UNKNOWN", field_code: "sales_channel", source: "order.customFields", omitted_reason: "field_absent_on_order" });
+      expect(o.channel).toEqual({ value: "unknown", basis: "unmapped" });
+    }
+    expect(parsed.sales_channel_completeness).toEqual({ mapped: 0, unknown: 2 });
   });
 
   it("malformed item entries (null/undefined/primitive/array) project fail-closed safe items without throwing", () => {
