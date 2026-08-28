@@ -226,7 +226,7 @@ export async function handleOrdersHistory(params: z.infer<typeof ordersHistorySc
         returned: projected.length,
         hasMore: totalCount !== null ? page * params.limit < totalCount : null,
       },
-      note: "Safe projection: only allowlisted status/payment changes are emitted; pass raw:true for the untouched RetailCRM payload.",
+      note: "Safe projection: only allowlisted status/payment changes plus the safe full_paid_at transition are emitted; pass raw:true for the untouched RetailCRM payload.",
     });
   });
 }

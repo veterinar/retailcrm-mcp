@@ -51,13 +51,17 @@ without persisting customer identity.
    aggregate revenue as complete. The default bounds must cover at least 10,000
    orders, so a 3,468-order month is not truncated at 2,000.
 9. Paid status codes are obtained from `/reference/payment-statuses` using the
-   provider's `paymentComplete` flag. `paid_at` uses `fullPaidAt`, falling back
-   only to a `paidAt` timestamp from a payment whose status is complete.
+   provider's `paymentComplete` flag only to calculate the known paid amount.
+   `paid_at` and whole-order CRM payment evidence use only the non-empty
+   `order.fullPaidAt`; payment timestamps and workflow order status are not
+   fallbacks. The detailed evidence states and amount semantics are defined by
+   `retailcrm-full-paid-evidence-v3.md`.
 10. `retailcrm_order_history_analytics` follows the official incremental
     `sinceId` algorithm, returns a PII-free projection, the maximum processed id
     as `next_since_id`, completeness, count and continuation reason. Old/new
-    values are emitted only for allowlisted status/payment fields; arbitrary
-    changed values are omitted.
+    values are emitted only for allowlisted status/payment fields and the safe
+    `full_paid_at` transition (string/null only); arbitrary changed values are
+    omitted.
 11. Legacy `orders_history` finally honors its existing `raw` parameter:
     `raw:true` preserves the explicit legacy raw response; the default returns
     the safe history projection. Existing create/update/list/get behavior and

@@ -33,7 +33,8 @@ PII-free SEO-SXO analytics surface (criteria:
   `sinceId`+`page` with HTTP 400 since 2023-05-15), each follow-up sends only
   `filter[sinceId]` = max processed id, and a non-advancing cursor fails
   closed. Old/new change values are emitted only for allowlisted
-  status/payment fields; `next_since_id` resumes the feed.
+  status/payment fields and the safe `full_paid_at` transition (string/null
+  only); `next_since_id` resumes the feed.
 - Attribution and channel configuration via `RETAILCRM_ANALYTICS_ATTRIBUTION`
   and `RETAILCRM_ANALYTICS_CHANNEL_MAP` (canonical-key-to-code maps; unknown
   keys, duplicate codes, malformed JSON and unsafe tokens fail closed or become
@@ -42,8 +43,9 @@ PII-free SEO-SXO analytics surface (criteria:
 ### Changed
 - **`orders_history` now honors its `raw` parameter** (criteria #11):
   `raw:true` preserves the explicit legacy raw payload; the default returns a
-  safe PII-free history projection (allowlisted status/payment changes, join
-  key omitted rather than required when the analytics secret is unconfigured).
+  safe PII-free history projection (allowlisted status/payment changes plus
+  the safe `full_paid_at` transition, with the join key omitted rather than
+  required when the analytics secret is unconfigured).
   Existing create/update/list/get behavior and read-only tool filtering are
   unchanged.
 
@@ -65,16 +67,19 @@ PII-free SEO-SXO analytics surface (criteria:
   (`filter[fullPaidAtFrom]`/`[fullPaidAtTo]`, `date_basis: full_paid_at`) —
   the tool's business output is paid revenue. `retailcrm_orders_analytics`
   keeps `createdAt` windows (`date_basis: created_at`). Both state their
-  basis in the output. `paid_at` projection semantics unchanged.
+  basis in the output. Whole-order CRM payment and `paid_at` use only the
+  non-empty `order.fullPaidAt`; individually complete payment statuses are
+  used only to calculate the known paid amount.
 - **History join-key honesty (criterion 5/10):** history records carry no
   order `number`, so without an `orderExternalId` no join key is emitted
   (`join_key: null` + `join_key_omitted_reason: "no_order_external_id"`) —
   the CRM id is never HMAC-ed as though it matched the /orders basis, which
   would have silently false-joined records. ExternalId records keep the
   normal key.
-- **History old/new allowlist is `status` and `payments` only**
-  (criterion 10): `fullPaidAt`, `orderMethod`, `site`, `totalSumm` and
-  `currency` no longer emit old/new values and are omitted entirely.
+- **History old/new allowlist is `status`, `payments` and safe
+  `full_paid_at` only** (criterion 10): `fullPaidAt` is renamed and limited to
+  string/null values; `orderMethod`, `site`, `totalSumm` and `currency` do not
+  emit old/new values and are omitted entirely.
 - **Legacy `orders_history` cursor calls omit `page`**: when
   `filter_since_id` is present the request carries no `page` parameter (the
   official API rejects `sinceId`+`page` with HTTP 400 since 2023-05-15);

@@ -35,7 +35,7 @@ function safeItemRaw(v: unknown): AsxItemRaw | null {
   return v as AsxItemRaw;
 }
 
-interface AsxPaymentRaw { status?: string; paidAt?: string }
+interface AsxPaymentRaw { status?: string; paidAt?: string; amount?: number }
 
 interface AsxOrderRaw {
   id?: number;
@@ -420,6 +420,81 @@ export type OrderEconomics = {
   completeness: EconomicsCompleteness;
 };
 
+// ── Payment evidence (full-paid contract v3) ─────────────────
+//
+// order.fullPaidAt is the SOLE RetailCRM full-payment fact. The reference
+// payment-status flag paymentComplete selects individual payments for AMOUNT
+// evidence only — it never establishes order-level full payment, and no
+// payments[].paidAt is ever copied into order-level paid_at. FINANCE_CONFIRMED
+// is reserved for a downstream settlement join this MCP does not have.
+
+export type PaymentEvidenceStatus = "CRM_PAID" | "PARTIAL" | "UNKNOWN";
+
+export type PaymentEvidence = {
+  crm_fully_paid: boolean;
+  crm_paid_amount: number | null;
+  amount_matches: boolean | null;
+  evidence_status: PaymentEvidenceStatus;
+  full_payment_source: "order.fullPaidAt";
+  paid_amount_source: "payments[].amount where reference payment status paymentComplete=true";
+  finance_confirmation_source: null;
+};
+
+/**
+ * crm_paid_amount (criterion 4): cent-rounded sum of the `amount` of every
+ * complete payment. 0 for an absent/null container or no complete payments.
+ * null for a structurally invalid container (array/primitive) or any selected
+ * complete payment whose amount is missing, non-number, non-finite or
+ * negative. Numeric strings are never coerced. A record/dictionary is the
+ * only valid non-empty container; malformed NON-complete entries are ignored
+ * (they are not selected and so contribute no amount evidence).
+ */
+// Integer-kopeck conversion for payment-contract amounts. Math.round(n*100)
+// suffers binary-float error (1.005*100 === 100.49999... → 100); instead the
+// decimal String representation is split into coefficient/exponent and the
+// exponent is decimal-shifted by +2, so 1.005 → "1005e-1" → 100.5 → 101.
+function toKopecks(n: number): number | null {
+  if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return null;
+  const s = n.toString();
+  const eIndex = s.indexOf("e");
+  const mant = eIndex === -1 ? s : s.slice(0, eIndex);
+  const exp = eIndex === -1 ? 0 : parseInt(s.slice(eIndex + 1), 10);
+  if (!Number.isInteger(exp)) return null;
+  const dot = mant.indexOf(".");
+  const fracDigits = dot === -1 ? 0 : mant.length - dot - 1;
+  const coeff = mant.replace(".", "");
+  if (coeff === "" || coeff === "-") return null;
+  const shifted = Number(`${coeff}e${exp - fracDigits + 2}`);
+  if (!Number.isFinite(shifted)) return null;
+  const kopecks = Math.round(shifted);
+  if (!Number.isSafeInteger(kopecks)) return null;
+  return kopecks;
+}
+
+/**
+ * Sums the validated amounts of every selected complete payment and converts
+ * the total to integer kopecks. Also returns null when the sum is finite and
+ * non-negative but its integer-kopeck value exceeds Number safe-integer
+ * precision (unsafe integer-kopeck conversion returns null, never a lossy
+ * amount).
+ */
+export function computeCrmPaidAmount(payments: unknown, paidStatusCodes: Set<string>): number | null {
+  if (payments === undefined || payments === null) return 0;
+  if (typeof payments !== "object" || Array.isArray(payments)) return null;
+  let sum = 0;
+  for (const v of Object.values(payments as Record<string, unknown>)) {
+    if (v === null || typeof v !== "object" || Array.isArray(v)) continue;
+    const p = v as AsxPaymentRaw;
+    if (typeof p.status !== "string" || !paidStatusCodes.has(p.status)) continue;
+    if (!nonNegativeFinite(p.amount)) return null;
+    sum += p.amount;
+    if (!Number.isFinite(sum)) return null;
+  }
+  const kopecks = toKopecks(sum);
+  if (kopecks === null) return null;
+  return kopecks / 100;
+}
+
 export type AnalyticsOrder = {
   id: number;
   external_id: string | null;
@@ -439,6 +514,7 @@ export type AnalyticsOrder = {
   delivery: AnalyticsDelivery | null;
   channel: { value: Channel; basis: ChannelBasis };
   economics: OrderEconomics;
+  payment_evidence: PaymentEvidence;
   join_key: string | null;
 };
 
@@ -541,20 +617,35 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
   if (o === null || typeof o !== "object" || typeof o.id !== "number") {
     return { error: "order is malformed: missing numeric id" };
   }
-  const payments = o.payments !== null && typeof o.payments === "object" ? Object.values(o.payments) : [];
-  const completePayments = payments.filter(p => typeof p?.status === "string" && ctx.paidStatusCodes.has(p.status));
-  // Fallback: the LATEST valid paidAt among complete payments (Date.parse
-  // comparison), never the first insertion-order value; unparsable values are ignored.
-  let fallbackPaidAt: string | null = null;
-  let fallbackPaidAtMs = Number.NEGATIVE_INFINITY;
-  for (const p of completePayments) {
-    if (typeof p.paidAt !== "string") continue;
-    const ms = Date.parse(p.paidAt);
-    if (Number.isNaN(ms) || ms <= fallbackPaidAtMs) continue;
-    fallbackPaidAt = p.paidAt;
-    fallbackPaidAtMs = ms;
-  }
-  const paidAt = typeof o.fullPaidAt === "string" ? o.fullPaidAt : fallbackPaidAt;
+  // Full payment evidence (criterion v3): order.fullPaidAt is the ONLY source
+  // of crm_fully_paid / paid_at. There is NO fallback from payments[].paidAt.
+  const crmFullyPaid = typeof o.fullPaidAt === "string" && o.fullPaidAt !== "";
+  const paidAt = crmFullyPaid ? (o.fullPaidAt as string) : null;
+  const crmPaidAmount = computeCrmPaidAmount(o.payments, ctx.paidStatusCodes);
+  // Fail-closed amount contract: only a finite non-negative totalSumm is
+  // evidence; negative/NaN/Infinity project as null (never coerced to zero).
+  const total = nonNegativeFinite(o.totalSumm) ? o.totalSumm : null;
+  // amount_matches: exact integer-kopeck equality of KNOWN amounts; null when
+  // either is unknown or cannot be represented safely in kopecks.
+  // Overpayment is false, never equality.
+  const paidKopecks = crmPaidAmount !== null ? toKopecks(crmPaidAmount) : null;
+  const totalKopecks = total !== null ? toKopecks(total) : null;
+  const amountMatches = paidKopecks !== null && totalKopecks !== null ? paidKopecks === totalKopecks : null;
+  // evidence_status: CRM_PAID whenever fullPaidAt is present (regardless of
+  // amount completeness); PARTIAL only when fullPaidAt is absent AND the paid
+  // amount is known > 0 and < a known order total; UNKNOWN otherwise.
+  let evidenceStatus: PaymentEvidenceStatus = "UNKNOWN";
+  if (crmFullyPaid) evidenceStatus = "CRM_PAID";
+  else if (crmPaidAmount !== null && total !== null && crmPaidAmount > 0 && crmPaidAmount < total) evidenceStatus = "PARTIAL";
+  const paymentEvidence: PaymentEvidence = {
+    crm_fully_paid: crmFullyPaid,
+    crm_paid_amount: crmPaidAmount,
+    amount_matches: amountMatches,
+    evidence_status: evidenceStatus,
+    full_payment_source: "order.fullPaidAt",
+    paid_amount_source: "payments[].amount where reference payment status paymentComplete=true",
+    finance_confirmation_source: null,
+  };
   const src = typeof o.source === "string"
     ? { source: o.source, medium: null, campaign: null }
     : { source: o.source?.source ?? null, medium: o.source?.medium ?? null, campaign: o.source?.campaign ?? null };
@@ -596,9 +687,7 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
       status: typeof o.status === "string" ? o.status : null,
       order_method: typeof o.orderMethod === "string" ? o.orderMethod : null,
       site: typeof o.site === "string" ? o.site : null,
-      // Fail-closed amount contract: only a finite non-negative totalSumm is
-      // evidence; negative/NaN/Infinity project as null (never coerced to zero).
-      total: nonNegativeFinite(o.totalSumm) ? o.totalSumm : null,
+      total,
       currency: typeof o.currency === "string" ? o.currency : null,
       source: src,
       // Native RetailCRM analytics label — explicitly NOT Yandex Metrica client_id.
@@ -609,9 +698,12 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
       delivery,
       channel: classifyChannel(o, ctx.channelMap),
       economics,
+      payment_evidence: paymentEvidence,
       join_key: orderJoinKey(o, ctx.secret),
     },
-    paid: typeof o.fullPaidAt === "string" || completePayments.length > 0,
+    // Internal paid pair: ONLY crm_fully_paid (order.fullPaidAt) — never a
+    // payment status, order status or payment timestamp.
+    paid: crmFullyPaid,
   };
 }
 
@@ -766,6 +858,14 @@ function analyticsEnvelope(
       mapped: orders.filter(o => o.channel.value !== "unknown").length,
       unknown: orders.filter(o => o.channel.value === "unknown").length,
     },
+    payment_evidence_counts: {
+      crm_paid: orders.filter(o => o.payment_evidence.evidence_status === "CRM_PAID").length,
+      partial: orders.filter(o => o.payment_evidence.evidence_status === "PARTIAL").length,
+      unknown: orders.filter(o => o.payment_evidence.evidence_status === "UNKNOWN").length,
+      // Presence by non-null: a KNOWN ZERO counts as present, never as missing.
+      crm_paid_amount_present: orders.filter(o => o.payment_evidence.crm_paid_amount !== null).length,
+      amount_matches_present: orders.filter(o => o.payment_evidence.amount_matches !== null).length,
+    },
     economics_completeness: {
       order_count: orders.length,
       // Presence counts only — a missing component is never counted as zero.
@@ -871,7 +971,15 @@ export async function handlePaidOrders(params: z.infer<typeof paidOrdersSchema>)
     // business output is paid revenue, so the period selects when orders were
     // fully paid, not when they were created. date_basis says so in the output.
     const collected = await collectAnalyticsOrders(params.date_from, params.date_to, params.max_pages, params.max_orders, ctx, "full_paid_at");
-    const paidOnly = collected.orders.filter(e => e.paid);
+    // Fail closed (criterion 8): the provider window was filtered with
+    // fullPaidAtFrom/fullPaidAtTo, so EVERY returned order must carry a
+    // non-empty fullPaidAt. An order without one means the provider window and
+    // the evidence disagree — never silently filter it away or reduce the cohort.
+    const notPaid = collected.orders.filter(e => !e.paid);
+    if (notPaid.length > 0) {
+      return fail(`RetailCRM paid-orders window returned ${notPaid.length} order(s) without fullPaidAt (first order id ${notPaid[0].order.id}) — provider window disagrees with full-payment evidence; failing closed instead of publishing a reduced cohort`);
+    }
+    const paidOnly = collected.orders;
     return ok({
       ...analyticsEnvelope(params.date_from, params.date_to, { ...collected, orders: paidOnly }, "full_paid_at", { max_pages: params.max_pages, max_orders: params.max_orders }),
       paid_count: paidOnly.length,
@@ -925,14 +1033,16 @@ export async function handleOrderAttribution(params: z.infer<typeof orderAttribu
 
 const HISTORY_LIMIT = 100;
 
-// Allowlisted change fields (criterion 10): OLD/NEW values are exposed ONLY
-// for safe status and payment fields. Business fields such as fullPaidAt,
-// orderMethod, site, totalSumm and currency — and everything else: comments,
-// customer data, delivery addresses, arbitrary custom fields — are omitted
-// entirely, not blanked.
+// Allowlisted change fields (criterion v3): OLD/NEW values are exposed ONLY
+// for safe status and payment fields, plus the fullPaidAt transition as
+// `full_paid_at` (string/null shapes only — every other shape fails to null).
+// Business fields such as orderMethod, site, totalSumm and currency — and
+// everything else: comments, customer data, delivery addresses, arbitrary
+// custom fields — are omitted entirely, not blanked.
 const HISTORY_FIELD_MAP: Record<string, string> = {
   status: "status",
   payments: "payments",
+  fullPaidAt: "full_paid_at",
 };
 
 const HISTORY_PAYMENT_FIELDS = new Set(["status", "paidAt", "amount", "type"]);
@@ -954,6 +1064,9 @@ export type HistoryRecord = {
 /** History values are mixed (scalars, status objects, payment dicts) — sanitize deny-by-default. */
 function sanitizeHistoryValue(field: string, v: unknown): unknown {
   if (v === null || v === undefined) return null;
+  // fullPaidAt: ONLY string or null ever survives; objects, arrays, numbers
+  // and every other shape fail closed to null.
+  if (field === "fullPaidAt") return typeof v === "string" ? v : null;
   // payments: ONLY the documented dictionary shape ({code: {status, paidAt, amount, type}})
   // is accepted — scalar/array/anomalous payments values fail closed to null.
   if (field === "payments") {
