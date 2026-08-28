@@ -1248,3 +1248,211 @@ describe("analytics-sxo v2 economics and channels", () => {
     expect(malformedTotals.total_amount_completeness).toEqual({ present: 0, missing: 3 });
   });
 });
+
+// v5 commercial lifecycle (docs/criteria/retailcrm-commercial-lifecycle-v5.md).
+// PROTECTION TESTS — required RED on base 68b8f0e296031037da43909e45b7db63fce5ed33:
+// lifecycle, commercial_result and commercial_paid_count are absent there.
+describe("analytics-sxo v5 commercial lifecycle", () => {
+  // Exact status-code → group map from /reference/statuses. Provider group
+  // "cancel" is the ONLY cancellation evidence; every other group is INCLUDED.
+  const statusesPage = {
+    v: 1, ok: true, status: 200,
+    data: {
+      success: true,
+      statuses: {
+        new: { code: "new", name: "New", group: "new" },
+        complete: { code: "complete", name: "Complete", group: "completed" },
+        cancel: { code: "cancel", name: "Cancelled", group: "cancel" },
+        "cancel-by-customer": { code: "cancel-by-customer", name: "Cancelled by customer", group: "cancel" },
+        assembling: { code: "assembling", name: "Assembling", group: "assembling" },
+      },
+    },
+  };
+
+  const malformedStatusesPage = {
+    v: 1, ok: true, status: 200,
+    data: { success: true, statuses: { broken: "not-an-object" } },
+  };
+
+  type RawOrder = Record<string, unknown>;
+  const ordersPage = (orders: RawOrder[], totalCount = orders.length) => ({
+    v: 1, ok: true, status: 200,
+    data: {
+      success: true, generatedAt: "2026-08-01T00:00:00",
+      orders,
+      pagination: { currentPage: 1, totalPageCount: 1, totalCount },
+    },
+  });
+
+  const install = (bridge: ReturnType<typeof mockBridge>, orders: RawOrder[], opts: { statuses?: unknown } = {}) => {
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      if (req.path === "/reference/statuses") return opts.statuses ?? statusesPage;
+      return ordersPage(orders);
+    });
+  };
+
+  const WINDOW = { date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 100 };
+
+  it("exact provider status group cancel yields lifecycle CANCELLED with commercial_included=false; non-cancel groups are INCLUDED", async () => {
+    install(mockBridge([]), [
+      { id: 1, status: "cancel", items: [], totalSumm: 100 },                      // exact cancel group code
+      { id: 2, status: "cancel-by-customer", items: [], totalSumm: 200 },          // another code in group cancel
+      { id: 3, status: "complete", items: [], totalSumm: 300 },                    // non-cancel group => INCLUDED
+      { id: 4, status: "assembling", items: [], totalSumm: 400 },                  // any non-cancel group => INCLUDED
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics(WINDOW)).text);
+    const lifecycles = parsed.orders.map((o: { lifecycle: { class: string; commercial_included: boolean; status_code: string | null; status_group: string | null } }) =>
+      [o.lifecycle.class, o.lifecycle.commercial_included, o.lifecycle.status_code, o.lifecycle.status_group]);
+    expect(lifecycles).toEqual([
+      ["CANCELLED", false, "cancel", "cancel"],
+      ["CANCELLED", false, "cancel-by-customer", "cancel"],
+      ["INCLUDED", true, "complete", "completed"],
+      ["INCLUDED", true, "assembling", "assembling"],
+    ]);
+  });
+
+  it("cancellation is never inferred from non-status evidence: item isCanceled, delivery or missing payments cannot make CANCELLED", async () => {
+    install(mockBridge([]), [
+      // No mapped cancel status — item cancellation and delivery signals are noise.
+      { id: 1, status: "complete", items: [{ offer: { xmlId: "SKU-C" }, quantity: 1, isCanceled: true }], delivery: { code: "return-to-seller" }, totalSumm: 500 },
+      { id: 2, status: "assembling", payments: null, items: [], totalSumm: 600 },
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics(WINDOW)).text);
+    for (const o of parsed.orders) {
+      expect(o.lifecycle.class).toBe("INCLUDED");
+      expect(o.lifecycle.commercial_included).toBe(true);
+    }
+  });
+
+  it("positive configured return_total yields RETURNED and takes precedence over a cancel status group", async () => {
+    process.env.RETAILCRM_ANALYTICS_ECONOMICS = JSON.stringify({ return_total: "return_amount" });
+    install(mockBridge([]), [
+      // Explicit positive monetary return evidence on a cancel-group order: RETURNED wins.
+      { id: 1, status: "cancel", items: [], totalSumm: 1000, customFields: { return_amount: 250 } },
+      // Same evidence on an included order: RETURNED as well.
+      { id: 2, status: "complete", items: [], totalSumm: 800, customFields: { return_amount: 100 } },
+      // Zero return_total is NOT positive evidence: no RETURNED class is fabricated.
+      { id: 3, status: "complete", items: [], totalSumm: 300, customFields: { return_amount: 0 } },
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics(WINDOW)).text);
+    expect(parsed.orders[0].lifecycle.class).toBe("RETURNED");
+    expect(parsed.orders[0].lifecycle.commercial_included).toBe(false);
+    expect(parsed.orders[1].lifecycle.class).toBe("RETURNED");
+    expect(parsed.orders[1].lifecycle.commercial_included).toBe(false);
+    expect(parsed.orders[2].lifecycle.class).toBe("INCLUDED");
+  });
+
+  it("absent return evidence never fabricates a returned order; RETURNED requires exact configured numeric evidence", async () => {
+    // Unconfigured return_total: no explicit monetary evidence exists at all.
+    install(mockBridge([]), [
+      { id: 1, status: "complete", items: [], totalSumm: 700, customFields: { return_amount: 999 } }, // code not configured — value invisible
+      { id: 2, status: "cancel", items: [], totalSumm: 100 },                                          // cancel without any return amount
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics(WINDOW)).text);
+    const classes = parsed.orders.map((o: { lifecycle: { class: string } }) => o.lifecycle.class);
+    expect(classes).toEqual(["INCLUDED", "CANCELLED"]);
+    expect(classes).not.toContain("RETURNED");
+    expect(parsed.commercial_result.counts.returned).toBe(0);
+  });
+
+  it("unmapped or missing status yields UNKNOWN with commercial_included=false and is excluded from commercial_result", async () => {
+    install(mockBridge([]), [
+      { id: 1, status: "not-in-reference", items: [], totalSumm: 100 }, // code absent from /reference/statuses
+      { id: 2, items: [], totalSumm: 200 },                             // no status at all
+      { id: 3, status: 42, items: [], totalSumm: 300 },                 // non-string status
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics(WINDOW)).text);
+    for (const o of parsed.orders) {
+      expect(o.lifecycle.class).toBe("UNKNOWN");
+      expect(o.lifecycle.commercial_included).toBe(false);
+      expect(o.lifecycle.omitted_reason).toBeTruthy();
+    }
+    expect(parsed.commercial_result.counts.unknown).toBe(3);
+    expect(parsed.commercial_result.counts.included).toBe(0);
+  });
+
+  it("operational totals/count stay on ALL observed orders while commercial_result counts and revenue include only INCLUDED orders; returned amount is separate", async () => {
+    install(mockBridge([]), [
+      { id: 1, status: "complete", items: [], totalSumm: 1000 },
+      { id: 2, status: "complete", items: [], totalSumm: 2000 },
+      { id: 3, status: "cancel", items: [], totalSumm: 500 },
+      { id: 4, status: "new", items: [] }, // no total: observed but amount-less
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics(WINDOW)).text);
+    // Operational surface is backward-compatible: every observed order counts.
+    expect(parsed.count).toBe(4);
+    expect(parsed.orders).toHaveLength(4);
+    expect(parsed.totals.revenue).toBeNull(); // one order total missing => null, never zero
+    // Commercial result excludes CANCELLED (and any non-INCLUDED class).
+    // `new` maps to a non-cancel reference group, so order 4 is INCLUDED and
+    // counts toward included — but it lacks a totalSumm, so by the fail-closed
+    // contract included_revenue is null (missing amounts are never zero).
+    expect(parsed.commercial_result.counts).toEqual({ included: 3, cancelled: 1, returned: 0, unknown: 0 });
+    expect(parsed.commercial_result.included_revenue).toBeNull(); // one INCLUDED order lacks a total
+    expect(parsed.commercial_result.amount_completeness).toEqual({
+      included_totals_present: 2,
+      included_totals_missing: 1,
+      returned_amount_known: true,
+    });
+    expect(parsed.commercial_result.publishable).toBe(false); // INCLUDED order without a total blocks publication
+    // Returned amount is its own figure, never folded into included revenue.
+    expect(parsed.commercial_result.returned_amount).toBe(0);
+  });
+
+  it("commercial_result.publishable is false with an UNKNOWN lifecycle and true for a complete fully classified window with all included totals present", async () => {
+    // Mixed window: an UNKNOWN order blocks publication.
+    install(mockBridge([]), [
+      { id: 1, status: "complete", items: [], totalSumm: 1000 },
+      { id: 2, status: "mystery", items: [], totalSumm: 2000 }, // unmapped => UNKNOWN
+    ]);
+    const blocked = JSON.parse((await handleOrdersAnalytics(WINDOW)).text);
+    expect(blocked.complete).toBe(true);           // traversal itself completed
+    expect(blocked.commercial_result.publishable).toBe(false);
+    expect(blocked.commercial_result.counts.unknown).toBe(1);
+
+    // Fully classified complete window: every INCLUDED order has a known total.
+    install(mockBridge([]), [
+      { id: 1, status: "complete", items: [], totalSumm: 1000 },
+      { id: 2, status: "cancel", items: [], totalSumm: 500 },
+    ]);
+    const clean = JSON.parse((await handleOrdersAnalytics({ ...WINDOW, date_from: "2026-08-01", date_to: "2026-08-31" })).text);
+    expect(clean.commercial_result.publishable).toBe(true);
+    expect(clean.commercial_result.counts).toEqual({ included: 1, cancelled: 1, returned: 0, unknown: 0 });
+    expect(clean.commercial_result.included_revenue).toBe(1000);
+
+    // Fully classified but an INCLUDED order lacks its total: never publishable, revenue null.
+    install(mockBridge([]), [
+      { id: 1, status: "complete", items: [] }, // INCLUDED without totalSumm
+    ]);
+    const missing = JSON.parse((await handleOrdersAnalytics({ ...WINDOW, date_from: "2026-09-01", date_to: "2026-09-30" })).text);
+    expect(missing.commercial_result.counts.included).toBe(1);
+    expect(missing.commercial_result.publishable).toBe(false);
+    expect(missing.commercial_result.included_revenue).toBeNull(); // missing amounts are never zero
+  });
+
+  it("malformed /reference/statuses fails closed before publishing analytics", async () => {
+    install(mockBridge([]), [{ id: 1, status: "complete", items: [], totalSumm: 100 }], { statuses: malformedStatusesPage });
+    const r = await handleOrdersAnalytics(WINDOW);
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/malformed/i);
+  });
+
+  it("retailcrm_paid_orders keeps paid_count for all CRM-full-paid rows and adds commercial_paid_count for INCLUDED rows only", async () => {
+    process.env.RETAILCRM_ANALYTICS_ECONOMICS = JSON.stringify({ return_total: "return_amount" });
+    install(mockBridge([]), [
+      // All rows carry fullPaidAt: paid_count counts every CRM-full-paid row.
+      { id: 1, status: "complete", items: [], totalSumm: 1000, fullPaidAt: "2026-07-02T09:00:00" },
+      { id: 2, status: "cancel", items: [], totalSumm: 500, fullPaidAt: "2026-07-03T09:00:00" },
+      { id: 3, status: "complete", items: [], totalSumm: 700, fullPaidAt: "2026-07-04T09:00:00", customFields: { return_amount: 700 } },
+    ]);
+    const parsed = JSON.parse((await handlePaidOrders(WINDOW)).text);
+    // Compatibility: paid_count is every CRM-full-paid order, regardless of lifecycle.
+    expect(parsed.paid_count).toBe(3);
+    // Commercial cohort: only INCLUDED rows.
+    expect(parsed.commercial_paid_count).toBe(1);
+    expect(parsed.commercial_result.counts).toEqual({ included: 1, cancelled: 1, returned: 1, unknown: 0 });
+    expect(parsed.commercial_result.included_revenue).toBe(1000);
+    expect(parsed.commercial_result.returned_amount).toBe(700);
+  });
+});
