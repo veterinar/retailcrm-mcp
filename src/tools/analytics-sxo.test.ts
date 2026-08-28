@@ -113,7 +113,7 @@ describe("analytics-sxo projection", () => {
     expect(parsed.totals.revenue).toBe(1500);
   });
 
-  it("maps paymentComplete statuses and paid_at fallback", async () => {
+  it("fullPaidAt is the only full-payment fact; complete payments never make an order paid", async () => {
     const bridge = mockBridge([]);
     bridge.implement(req => {
       if (req.path === "/reference/payment-statuses") return paidStatusPage;
@@ -124,34 +124,165 @@ describe("analytics-sxo projection", () => {
             { id: 1, fullPaidAt: "2026-07-02T09:00:00", payments: { a: { status: "paid", paidAt: "2026-07-01T12:00:00" } } },
             { id: 2, payments: { a: { status: "pending", paidAt: "2026-07-01T12:00:00" } }, items: [] },
             { id: 3, payments: { a: { status: "paid", paidAt: "2026-07-03T08:30:00" } } },
+            { id: 4, fullPaidAt: "", payments: { a: { status: "paid", paidAt: "2026-07-03T08:30:00" } } },
           ],
-          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 3 },
+          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 4 },
         },
       };
     });
     const window = { date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 };
     const all = JSON.parse((await handleOrdersAnalytics(window)).text);
-    expect(all.orders.map((o: { id: number; paid_at: string | null }) => [o.id, o.paid_at])).toEqual([
-      [1, "2026-07-02T09:00:00"], // fullPaidAt wins over payment paidAt
-      [2, null],                  // non-complete payment never yields paid_at
-      [3, "2026-07-03T08:30:00"], // fallback to paidAt of a complete payment
+    expect(all.orders.map((o: { id: number; paid_at: string | null; payment_evidence: { crm_fully_paid: boolean } }) => [o.id, o.paid_at, o.payment_evidence.crm_fully_paid])).toEqual([
+      [1, "2026-07-02T09:00:00", true],   // fullPaidAt wins over payment paidAt
+      [2, null, false],                   // non-complete payment never yields paid_at
+      [3, null, false],                   // complete payment WITHOUT fullPaidAt is NOT paid, no fallback
+      [4, null, false],                   // empty-string fullPaidAt is not a non-empty string
     ]);
+    expect(all.payment_evidence_counts).toEqual({ crm_paid: 1, partial: 0, unknown: 3, crm_paid_amount_present: 1, amount_matches_present: 0 });
+    // A fully consistent paid cohort passes through untouched.
+    const bridge2 = mockBridge([]);
+    bridge2.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200, data: {
+          success: true,
+          orders: [
+            { id: 1, fullPaidAt: "2026-07-02T09:00:00" },
+            { id: 2, fullPaidAt: "2026-07-03T09:00:00" },
+            { id: 4, fullPaidAt: "2026-07-04T09:00:00" },
+          ],
+          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 3 },
+        },
+      };
+    });
     const paid = JSON.parse((await handlePaidOrders(window)).text);
-    expect(paid.paid_count).toBe(2);
-    expect(paid.count).toBe(2);
+    expect(paid.paid_count).toBe(3);
+    expect(paid.count).toBe(3);
     expect(paid.window_total_count).toBe(3);
+    expect(paid.payment_evidence_counts.crm_paid).toBe(3);
   });
 
-  it("paid_at fallback picks the LATEST complete-payment paidAt (insertion order older-first)", () => {
-    const r = projectOrder({
-      id: 9,
-      payments: {
-        a: { status: "paid", paidAt: "2026-07-01T12:00:00" }, // older — inserted FIRST
-        b: { status: "paid", paidAt: "2026-07-05T08:00:00" }, // newer — inserted SECOND
-      },
-    }, CTX);
-    if ("error" in r) throw new Error("projection failed");
-    expect(r.order.paid_at).toBe("2026-07-05T08:00:00");
+  it("paid-orders window fails closed when a provider-filtered order lacks fullPaidAt", async () => {
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200, data: {
+          success: true,
+          // One order in the fullPaidAtFrom/To cohort has NO fullPaidAt — the
+          // provider window and the evidence disagree: fail closed, never filter.
+          orders: [
+            { id: 1, fullPaidAt: "2026-07-02T09:00:00" },
+            { id: 2, payments: { a: { status: "paid", amount: 100 } } },
+          ],
+          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 2 },
+        },
+      };
+    });
+    const r = await handlePaidOrders({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("without fullPaidAt");
+    expect(r.text).toContain("failing closed");
+  });
+
+  it("payment evidence: amounts, matching, malformed containers and status independence", () => {
+    const ev = (o: Partial<Parameters<typeof projectOrder>[0]>) =>
+      projectOrder({ id: 1, ...o } as Parameters<typeof projectOrder>[0], CTX);
+    const evidenceOf = (r: ReturnType<typeof projectOrder>) =>
+      "error" in r ? (() => { throw new Error("projection failed"); })() : r.order.payment_evidence;
+    // Exact match: CRM_PAID with equal known amounts.
+    expect(evidenceOf(ev({ fullPaidAt: "2026-07-02T09:00:00", totalSumm: 1000.005, payments: { a: { status: "paid", amount: 600 }, b: { status: "paid", amount: 400.005 } } })))
+      .toMatchObject({ crm_fully_paid: true, crm_paid_amount: 1000.01, amount_matches: true, evidence_status: "CRM_PAID" });
+    // Known JavaScript monetary boundary: 1.005 must cent-round UP to 1.01
+    // (1.005 * 100 === 100.49999999999999, so Math.round alone yields 1.00).
+    expect(evidenceOf(ev({ fullPaidAt: "2026-07-02T09:00:00", totalSumm: 1.005, payments: { a: { status: "paid", amount: 1.005 } } })))
+      .toMatchObject({ crm_paid_amount: 1.01, amount_matches: true, evidence_status: "CRM_PAID" });
+    // Partial: no fullPaidAt, known paid amount > 0 and < known total.
+    expect(evidenceOf(ev({ totalSumm: 1000, payments: { a: { status: "paid", amount: 400 } } })))
+      .toMatchObject({ crm_fully_paid: false, crm_paid_amount: 400, amount_matches: false, evidence_status: "PARTIAL" });
+    // Overpaid: equality is false, never silently treated as a match.
+    expect(evidenceOf(ev({ fullPaidAt: "2026-07-02T09:00:00", totalSumm: 1000, payments: { a: { status: "paid", amount: 1500 } } })))
+      .toMatchObject({ crm_paid_amount: 1500, amount_matches: false, evidence_status: "CRM_PAID" });
+    // Malformed/missing amounts on a COMPLETE payment: crm_paid_amount null,
+    // amount_matches null, and — without fullPaidAt — UNKNOWN (never zero).
+    for (const badAmount of [undefined, "500" as unknown as number, Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      const r = ev({ payments: { a: { status: "paid", amount: badAmount } } });
+      expect(evidenceOf(r)).toMatchObject({ crm_fully_paid: false, crm_paid_amount: null, amount_matches: null, evidence_status: "UNKNOWN" });
+    }
+    // Structurally invalid containers (array/primitive): crm_paid_amount null.
+    // Absent/null container and no-complete-payments: crm_paid_amount 0.
+    expect(evidenceOf(ev({ payments: [{ status: "paid", amount: 100 }] as unknown as never })).crm_paid_amount).toBeNull();
+    expect(evidenceOf(ev({ payments: "paid" as unknown as never })).crm_paid_amount).toBeNull();
+    expect(evidenceOf(ev({ payments: null })).crm_paid_amount).toBe(0);
+    expect(evidenceOf(ev({ payments: { a: { status: "pending", amount: 100 } } })).crm_paid_amount).toBe(0);
+    expect(evidenceOf(ev({})).crm_paid_amount).toBe(0);
+    // amount_matches null when the order total is unknown.
+    expect(evidenceOf(ev({ payments: { a: { status: "paid", amount: 100 } } })).amount_matches).toBeNull();
+    // Status independence: identical evidence for "complete", "paid" and no status at all.
+    const statuses: (string | undefined)[] = ["complete", "paid", undefined];
+    for (const status of statuses) {
+      const r = ev({ status, totalSumm: 500, payments: { a: { status: "paid", amount: 500 } } });
+      expect(evidenceOf(r)).toMatchObject({ crm_fully_paid: false, crm_paid_amount: 500, amount_matches: true, evidence_status: "UNKNOWN" });
+    }
+    // fullPaidAt precedence: CRM_PAID even when the amount is unknown.
+    expect(evidenceOf(ev({ fullPaidAt: "2026-07-02T09:00:00", payments: { a: { status: "paid", amount: "500" as unknown as number } } })))
+      .toMatchObject({ crm_fully_paid: true, crm_paid_amount: null, amount_matches: null, evidence_status: "CRM_PAID" });
+    // Explicit sources; FINANCE_CONFIRMED is never emitted.
+    expect(evidenceOf(ev({ fullPaidAt: "2026-07-02T09:00:00" }))).toEqual({
+      crm_fully_paid: true, crm_paid_amount: 0, amount_matches: null, evidence_status: "CRM_PAID",
+      full_payment_source: "order.fullPaidAt",
+      paid_amount_source: "payments[].amount where reference payment status paymentComplete=true",
+      finance_confirmation_source: null,
+    });
+    // The internal projected pair keeps its shape; paid comes ONLY from crm_fully_paid.
+    const pair = ev({ fullPaidAt: "2026-07-02T09:00:00", payments: { a: { status: "paid", amount: 1 } } });
+    if ("error" in pair) throw new Error("projection failed");
+    expect(pair.paid).toBe(true);
+    expect(pair.paid).toBe(pair.order.payment_evidence.crm_fully_paid);
+    const unpaidPair = ev({ payments: { a: { status: "paid", amount: 1 } } });
+    if ("error" in unpaidPair) throw new Error("projection failed");
+    expect(unpaidPair.paid).toBe(false);
+  });
+
+  it("crm_paid_amount is null when the kopeck total exceeds safe-integer precision", () => {
+    const ev = (o: Partial<Parameters<typeof projectOrder>[0]>) =>
+      projectOrder({ id: 1, ...o } as Parameters<typeof projectOrder>[0], CTX);
+    const evidenceOf = (r: ReturnType<typeof projectOrder>) =>
+      "error" in r ? (() => { throw new Error("projection failed"); })() : r.order.payment_evidence;
+    // A finite, non-negative amount whose *100 kopeck value cannot be a safe
+    // integer projects crm_paid_amount null (and amount_matches null), never a
+    // lossy coercion. fullPaidAt keeps evidence_status at CRM_PAID.
+    expect(evidenceOf(ev({ fullPaidAt: "2026-07-02T09:00:00", payments: { a: { status: "paid", amount: Number.MAX_SAFE_INTEGER } } })))
+      .toMatchObject({ crm_fully_paid: true, crm_paid_amount: null, amount_matches: null, evidence_status: "CRM_PAID" });
+  });
+
+  it("envelope payment-evidence counts treat a known zero as present", async () => {
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200, data: {
+          success: true,
+          orders: [
+            // CRM_PAID with a known zero amount and a known total: both present.
+            { id: 1, fullPaidAt: "2026-07-02T09:00:00", totalSumm: 0 },
+            // PARTIAL: known amount 400 < known total 1000.
+            { id: 2, totalSumm: 1000, payments: { a: { status: "paid", amount: 400 } } },
+            // UNKNOWN: no fullPaidAt, structurally invalid payments container.
+            { id: 3, payments: "paid" as unknown as never },
+          ],
+          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 3 },
+        },
+      };
+    });
+    const parsed = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 })).text);
+    expect(parsed.payment_evidence_counts).toEqual({
+      crm_paid: 1,
+      partial: 1,
+      unknown: 1,
+      crm_paid_amount_present: 2, // known zero (order 1) + known 400 (order 2)
+      amount_matches_present: 2,  // 0==0 (order 1) + 400!=1000 (order 2)
+    });
   });
 
   it("item evidence per current OpenAPI: multi-price sum, discount fallback, string VAT, externalId SKU, malformed=>null", () => {
@@ -473,7 +604,7 @@ describe("retailcrm_order_history_analytics (official sinceId cursor)", () => {
     expect(parsed.records[0].join_key).toBe(expected);
   });
 
-  it("exposes old/new ONLY for status and payments; business fields are omitted", async () => {
+  it("exposes old/new ONLY for status, payments and full_paid_at; business fields are omitted", async () => {
     const bridge = mockBridge([]);
     bridge.implement(req => {
       if (req.path === "/reference/payment-statuses") return paidStatusPage;
@@ -491,18 +622,25 @@ describe("retailcrm_order_history_analytics (official sinceId cursor)", () => {
             mkRec(26, "totalSumm", 100, 200),
             mkRec(27, "currency", "RUB", "USD"),
             mkRec(28, "customerComment", null, "call me at 555"),
+            mkRec(29, "fullPaidAt", "2026-07-01 09:00:00", { ts: "2026-07-02 09:00:00" }), // non-string shape
+            mkRec(30, "fullPaidAt", 12345, "2026-07-03 09:00:00"),                          // numeric old value
           ],
-          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 8 },
+          pagination: { currentPage: 1, totalPageCount: 1, totalCount: 10 },
         },
       };
     });
     const parsed = JSON.parse((await handleOrderHistoryAnalytics({ max_pages: 1, max_records: 100 })).text);
-    expect(parsed.count).toBe(8);
-    // Only status/payments expose old/new values; every other field —
-    // including previously-allowlisted business fields — is omitted entirely.
+    expect(parsed.count).toBe(10);
+    // Only status/payments/full_paid_at expose old/new values; every other
+    // field — including previously-allowlisted business fields — is omitted entirely.
     expect(parsed.records[0].changes).toEqual({ status: { old: "new", new: "complete" } });
     expect(Object.keys(parsed.records[1].changes)).toEqual(["payments"]);
-    for (const i of [2, 3, 4, 5, 6, 7]) {
+    // fullPaidAt is exposed ONLY as the safe full_paid_at key: string/null
+    // shapes survive, every other shape fails closed to null.
+    expect(parsed.records[2].changes).toEqual({ full_paid_at: { old: null, new: "2026-07-02 09:00:00" } });
+    expect(parsed.records[8].changes).toEqual({ full_paid_at: { old: "2026-07-01 09:00:00", new: null } });
+    expect(parsed.records[9].changes).toEqual({ full_paid_at: { old: null, new: "2026-07-03 09:00:00" } });
+    for (const i of [3, 4, 5, 6, 7]) {
       expect(parsed.records[i].changes).toEqual({});
       expect(JSON.stringify(parsed.records[i].changes)).not.toContain("full_paid_at");
     }
@@ -602,6 +740,7 @@ describe("legacy orders_history: raw/default semantics (criterion 11)", () => {
       { id: 11, orderId: 501, createdAt: "2026-07-01 10:00:00", source: "api", field: "status", old_value: { code: "new" }, new_value: { code: "complete" } },
       { id: 12, orderId: 501, createdAt: "2026-07-01 11:00:00", source: "api", field: "customerComment", old_value: null, new_value: "call me at 555" },
       { id: 13, orderId: 502, orderExternalId: "EXT-502", createdAt: "2026-07-01 12:00:00", source: "api", field: "payments", old_value: null, new_value: { p1: { status: "paid", paidAt: "2026-07-02 09:00:00", amount: 1500, type: "cash", comment: "pay secret" } } },
+      { id: 14, orderId: 501, createdAt: "2026-07-01 13:00:00", source: "api", field: "fullPaidAt", old_value: null, new_value: "2026-07-02 09:00:00" },
     ],
     pagination: { currentPage: 1, totalPageCount: 3, totalCount: 45 },
   };
@@ -622,7 +761,7 @@ describe("legacy orders_history: raw/default semantics (criterion 11)", () => {
     const r = await handleOrdersHistory({ page: 1, limit: 20 });
     expect(r.isError).toBeFalsy();
     const parsed = JSON.parse(r.text);
-    expect(parsed.history).toHaveLength(3);
+    expect(parsed.history).toHaveLength(4);
     // Allowlisted status change: status object collapsed to its code
     expect(parsed.history[0].changes).toEqual({ status: { old: "new", new: "complete" } });
     // Non-allowlisted change (customerComment) is omitted entirely, not blanked
@@ -632,8 +771,10 @@ describe("legacy orders_history: raw/default semantics (criterion 11)", () => {
       new: { p1: { status: "paid", paidAt: "2026-07-02 09:00:00", amount: 1500, type: "cash" } },
       old: null,
     });
+    // fullPaidAt is emitted only as the safe full_paid_at change: string/null values
+    expect(parsed.history[3].changes).toEqual({ full_paid_at: { old: null, new: "2026-07-02 09:00:00" } });
     // Shaped pagination from the provider payload
-    expect(parsed.pagination).toEqual({ page: 1, totalCount: 45, returned: 3, hasMore: true });
+    expect(parsed.pagination).toEqual({ page: 1, totalCount: 45, returned: 4, hasMore: true });
     // PII never leaks; join key is null (weak secret) rather than failing the legacy tool
     for (const banned of ["call me at 555", "customerComment", "pay secret"]) expect(r.text).not.toContain(banned);
     expect(parsed.history[0].join_key).toBeNull();
