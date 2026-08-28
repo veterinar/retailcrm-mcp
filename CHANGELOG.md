@@ -35,10 +35,10 @@ PII-free SEO-SXO analytics surface (criteria:
   closed. Old/new change values are emitted only for allowlisted
   status/payment fields and the safe `full_paid_at` transition (string/null
   only); `next_since_id` resumes the feed.
-- Attribution and channel configuration via `RETAILCRM_ANALYTICS_ATTRIBUTION`
-  and `RETAILCRM_ANALYTICS_CHANNEL_MAP` (canonical-key-to-code maps; unknown
-  keys, duplicate codes, malformed JSON and unsafe tokens fail closed or become
-  `null` with an explicit omission reason — nothing is guessed).
+- Attribution configuration via `RETAILCRM_ANALYTICS_ATTRIBUTION`
+  (canonical-key-to-code map; unknown keys, duplicate codes, malformed JSON
+  and unsafe tokens fail closed or become `null` with an explicit omission
+  reason — nothing is guessed).
 
 ### Changed
 - **`orders_history` now honors its `raw` parameter** (criteria #11):
@@ -84,10 +84,16 @@ PII-free SEO-SXO analytics surface (criteria:
   `filter_since_id` is present the request carries no `page` parameter (the
   official API rejects `sinceId`+`page` with HTTP 400 since 2023-05-15);
   non-cursor raw/date calls keep `page` exactly as before.
-- **Prototype-key hardening:** the channel map is null-prototype and channel
-  plus configured-custom-field lookups are own-property-only, so inherited
-  keys (`"toString"`, `"__proto__"`) can never become channel
-  classifications or attribution values.
+- **Authoritative sales-channel projection:** `sales_channel` is read only from
+  the order's own `customFields.sales_channel`. Missing historical, empty,
+  malformed and unsupported values fail closed to `UNKNOWN`; delivery,
+  order-method, site, source and attribution signals cannot override it. The
+  legacy `channel` output remains compatibility-only and is derived from the
+  authoritative value without delivery fallback.
+- **Prototype-key hardening:** sales-channel and configured-custom-field
+  lookups are own-property-only, so inherited keys (`"toString"`,
+  `"__proto__"`) can never become channel classifications or attribution
+  values.
 - **`max_orders`/`max_records` are explicitly page-aligned soft stops**,
   documented in the schema descriptions and each output's `bounds` block
   (`semantics: "page_aligned_soft_stop"`): collection halts before fetching

@@ -256,82 +256,85 @@ function extractEconomicsAmounts(
 export const configuredEconomicsKeys = (cfg: EconomicsConfig): string[] =>
   cfg.configured ? Object.keys(cfg.codes).sort() : [];
 
-// ── Channel classification (explicit mapping only) ───────────
+// ── Sales channel (authoritative customFields.sales_channel) ──
 
-const CHANNELS = ["site", "phone", "chat", "ozon", "other_marketplace", "unknown"] as const;
-export type Channel = (typeof CHANNELS)[number];
+export type Channel = "site" | "phone" | "chat" | "ozon" | "other_marketplace" | "unknown";
 
-// Namespaced v2 prefixes, checked in classification-precedence source order.
-const CHANNEL_BASIS_PREFIX: Record<Exclude<ChannelBasis, "unmapped">, string> = {
-  order_method: "order_method:",
-  site: "site:",
-  source: "source:",
-  delivery: "delivery:",
+// Authoritative sales-channel contract: the sole evidence is the order's own
+// customFields.sales_channel value (fixed field code — never configurable).
+export type SalesChannel = "PETDOG_RU" | "OZON" | "OTHER_MARKETPLACE" | "B2B" | "B2G" | "UNKNOWN";
+
+const SALES_CHANNEL_FIELD_CODE = "sales_channel";
+
+// Deployed lowercase dictionary codes and canonical uppercase spellings —
+// exact strings only (matched against the original value, no case folding
+// or trim): mixed-case and whitespace-padded spellings are unsupported.
+const SALES_CHANNEL_CODES: Record<string, Exclude<SalesChannel, "UNKNOWN">> = {
+  petdog_ru: "PETDOG_RU",
+  ozon: "OZON",
+  other_marketplace: "OTHER_MARKETPLACE",
+  b2b: "B2B",
+  b2g: "B2G",
+  PETDOG_RU: "PETDOG_RU",
+  OZON: "OZON",
+  OTHER_MARKETPLACE: "OTHER_MARKETPLACE",
+  B2B: "B2B",
+  B2G: "B2G",
 };
 
-export function loadChannelMap(env: NodeJS.ProcessEnv = process.env): { map: Record<string, Channel> } | { error: string } {
-  const raw = env.RETAILCRM_ANALYTICS_CHANNEL_MAP;
-  if (!raw) return { map: Object.create(null) };
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return { error: "RETAILCRM_ANALYTICS_CHANNEL_MAP is not valid JSON (expected {site_or_method_code: channel})" };
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { error: "RETAILCRM_ANALYTICS_CHANNEL_MAP must be a JSON object mapping codes to channels" };
-  }
-  // Null-prototype map: no inherited keys can ever resolve as channel lookups.
-  const map: Record<string, Channel> = Object.create(null);
-  for (const [code, value] of Object.entries(parsed as Record<string, unknown>)) {
-    if (code === "") {
-      return { error: "RETAILCRM_ANALYTICS_CHANNEL_MAP: empty map key is not allowed" };
-    }
-    if (typeof value !== "string") {
-      return { error: `RETAILCRM_ANALYTICS_CHANNEL_MAP: unknown channel ${JSON.stringify(value)} for code "${code}" (allowed: ${CHANNELS.join(", ")})` };
-    }
-    // Legacy input alias: criterion v1 allowed `marketplace`; it normalizes
-    // immediately to the canonical output `other_marketplace` and is never emitted.
-    const normalized: string = value === "marketplace" ? "other_marketplace" : value;
-    if (!(CHANNELS as readonly string[]).includes(normalized)) {
-      return { error: `RETAILCRM_ANALYTICS_CHANNEL_MAP: unknown channel ${JSON.stringify(value)} for code "${code}" (allowed: ${CHANNELS.join(", ")})` };
-    }
-    map[code] = normalized as Channel;
-  }
-  return { map };
-}
-
-export type ChannelBasis = "order_method" | "site" | "source" | "delivery" | "unmapped";
+export type SalesChannelView = {
+  value: SalesChannel;
+  field_code: typeof SALES_CHANNEL_FIELD_CODE;
+  source: "order.customFields";
+  omitted_reason: string | null;
+};
 
 /**
- * v2 precedence per source order: namespaced then legacy lookup for
- * orderMethod, then site, then native source code, then delivery code.
- * Own-property lookups only — inherited keys ("toString", "__proto__") never
- * resolve. No free-text guessing: anything else is explicitly "unknown".
+ * Reads ONLY the order's own-property customFields.sales_channel. Absent,
+ * empty, non-string and unsupported values fail closed to UNKNOWN with a
+ * bounded machine-readable reason; the raw unsupported value is never
+ * exposed. delivery.code, orderMethod, site, native source and attribution
+ * never participate in sales-channel classification.
  */
-export function classifyChannel(o: AsxOrderRaw, map: Record<string, Channel>): { value: Channel; basis: ChannelBasis } {
-  const sourceCode = typeof o.source === "string"
-    ? o.source
-    : o.source !== null && typeof o.source === "object" && typeof o.source.source === "string" ? o.source.source : null;
-  const deliveryCode = o.delivery !== null && typeof o.delivery === "object" && typeof o.delivery.code === "string" ? o.delivery.code : null;
-  const candidates: [Exclude<ChannelBasis, "unmapped">, string | null][] = [
-    ["order_method", typeof o.orderMethod === "string" ? o.orderMethod : null],
-    ["site", typeof o.site === "string" ? o.site : null],
-    ["source", sourceCode],
-    ["delivery", deliveryCode],
-  ];
-  for (const [basis, code] of candidates) {
-    if (code === null || code === "") continue;
-    const namespaced = CHANNEL_BASIS_PREFIX[basis] + code;
-    if (hasOwn(map, namespaced)) return { value: map[namespaced], basis };
-    if (hasOwn(map, code)) return { value: map[code], basis };
+export function extractSalesChannel(o: AsxOrderRaw): SalesChannelView {
+  const base = { field_code: SALES_CHANNEL_FIELD_CODE, source: "order.customFields" } as const;
+  const cf = o.customFields !== null && typeof o.customFields === "object" && !Array.isArray(o.customFields)
+    ? (o.customFields as Record<string, unknown>) : null;
+  if (cf === null || !hasOwn(cf, SALES_CHANNEL_FIELD_CODE)) {
+    return { ...base, value: "UNKNOWN", omitted_reason: "field_absent_on_order" };
   }
-  return { value: "unknown", basis: "unmapped" };
+  const v = cf[SALES_CHANNEL_FIELD_CODE];
+  if (typeof v !== "string") return { ...base, value: "UNKNOWN", omitted_reason: "not_a_string" };
+  if (v.trim() === "") return { ...base, value: "UNKNOWN", omitted_reason: "empty" };
+  const canonical = hasOwn(SALES_CHANNEL_CODES as Record<string, unknown>, v)
+    ? SALES_CHANNEL_CODES[v as keyof typeof SALES_CHANNEL_CODES]
+    : undefined;
+  if (canonical === undefined) return { ...base, value: "UNKNOWN", omitted_reason: "unsupported_value" };
+  return { ...base, value: canonical, omitted_reason: null };
+}
+
+export type ChannelBasis = "sales_channel" | "unmapped";
+
+// Legacy compatibility taxonomy: derived ONLY from the authoritative value.
+// B2B/B2G have no legacy representation and map to legacy "unknown" while
+// sales_channel keeps the authoritative value.
+const LEGACY_CHANNEL_FROM_SALES: Record<Exclude<SalesChannel, "UNKNOWN">, Channel> = {
+  PETDOG_RU: "site",
+  OZON: "ozon",
+  OTHER_MARKETPLACE: "other_marketplace",
+  B2B: "unknown",
+  B2G: "unknown",
+};
+
+/** Legacy `channel` view derived only from the authoritative sales-channel result — no delivery/orderMethod/site/source fallback. */
+export function deriveChannel(sales: SalesChannelView): { value: Channel; basis: ChannelBasis } {
+  if (sales.value === "UNKNOWN") return { value: "unknown", basis: "unmapped" };
+  return { value: LEGACY_CHANNEL_FROM_SALES[sales.value], basis: "sales_channel" };
 }
 
 // ── Shared guard (fail closed before any bridge call) ────────
 
-type AnalyticsGuard = { secret: string; attribution: AttributionConfig; economics: EconomicsConfig; channelMap: Record<string, Channel> };
+type AnalyticsGuard = { secret: string; attribution: AttributionConfig; economics: EconomicsConfig };
 
 function guardConfig(): AnalyticsGuard | { error: string } {
   const secretCheck = checkAnalyticsSecret();
@@ -340,9 +343,7 @@ function guardConfig(): AnalyticsGuard | { error: string } {
   if ("error" in attribution) return attribution;
   const economics = loadEconomicsConfig();
   if ("error" in economics) return economics;
-  const channelMap = loadChannelMap();
-  if ("error" in channelMap) return channelMap;
-  return { secret: secretCheck.secret, attribution, economics, channelMap: channelMap.map };
+  return { secret: secretCheck.secret, attribution, economics };
 }
 
 // ── Paid statuses (paymentComplete) ──────────────────────────
@@ -512,6 +513,7 @@ export type AnalyticsOrder = {
   attribution: Record<string, AttributionTokenView>;
   items: AnalyticsItem[];
   delivery: AnalyticsDelivery | null;
+  sales_channel: SalesChannelView;
   channel: { value: Channel; basis: ChannelBasis };
   economics: OrderEconomics;
   payment_evidence: PaymentEvidence;
@@ -676,6 +678,7 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
     };
   });
   const delivery = projectDelivery(o.delivery);
+  const salesChannel = extractSalesChannel(o);
   const economics = buildEconomics(items, delivery, o.customFields, ctx.economics);
   return {
     order: {
@@ -696,7 +699,8 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
       attribution: buildAttribution(o.customFields, ctx.attribution),
       items,
       delivery,
-      channel: classifyChannel(o, ctx.channelMap),
+      sales_channel: salesChannel,
+      channel: deriveChannel(salesChannel),
       economics,
       payment_evidence: paymentEvidence,
       join_key: orderJoinKey(o, ctx.secret),
@@ -854,9 +858,17 @@ function analyticsEnvelope(
       // complete aggregate.
       publishable,
     },
+    // Both completeness keys count AUTHORITATIVE sales_channel values (mapped
+    // = value is not UNKNOWN). channel_completeness keeps the legacy envelope
+    // key but no longer counts delivery-derived legacy mappings, so legacy
+    // taxonomy gaps (B2B/B2G -> legacy "unknown") are not false unknowns.
     channel_completeness: {
-      mapped: orders.filter(o => o.channel.value !== "unknown").length,
-      unknown: orders.filter(o => o.channel.value === "unknown").length,
+      mapped: orders.filter(o => o.sales_channel.value !== "UNKNOWN").length,
+      unknown: orders.filter(o => o.sales_channel.value === "UNKNOWN").length,
+    },
+    sales_channel_completeness: {
+      mapped: orders.filter(o => o.sales_channel.value !== "UNKNOWN").length,
+      unknown: orders.filter(o => o.sales_channel.value === "UNKNOWN").length,
     },
     payment_evidence_counts: {
       crm_paid: orders.filter(o => o.payment_evidence.evidence_status === "CRM_PAID").length,
