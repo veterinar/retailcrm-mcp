@@ -35,7 +35,7 @@ function safeItemRaw(v: unknown): AsxItemRaw | null {
   return v as AsxItemRaw;
 }
 
-interface AsxPaymentRaw { status?: string; paidAt?: string; amount?: number }
+interface AsxPaymentRaw { status?: string; paidAt?: string; amount?: number; type?: string }
 
 interface AsxOrderRaw {
   id?: number;
@@ -256,6 +256,94 @@ function extractEconomicsAmounts(
 export const configuredEconomicsKeys = (cfg: EconomicsConfig): string[] =>
   cfg.configured ? Object.keys(cfg.codes).sort() : [];
 
+// ── Payment-provider configuration (v6: explicit, never guessed) ─
+
+const PROVIDER_ENV = "RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP";
+const PROVIDER_SET = ["SBER", "OZON", "CASH", "OTHER"] as const;
+export type PaymentProvider = (typeof PROVIDER_SET)[number] | "UNKNOWN";
+
+const isProvider = (v: string): v is (typeof PROVIDER_SET)[number] => (PROVIDER_SET as readonly string[]).includes(v);
+
+export type ProviderMapConfig =
+  | { configured: false }
+  | { configured: true; map: Map<string, (typeof PROVIDER_SET)[number]> };
+
+/**
+ * Optional explicit JSON map from EXACT RetailCRM payment type codes to the
+ * closed provider set SBER/OZON/CASH/OTHER. Absent configuration is valid
+ * (every order then projects payment_provider UNKNOWN). Malformed JSON, a
+ * non-object container, unsafe type-code keys or values outside the closed
+ * set are configuration errors — parsed before any bridge call.
+ */
+export function loadProviderMapConfig(env: NodeJS.ProcessEnv = process.env): ProviderMapConfig | { error: string } {
+  const raw = env[PROVIDER_ENV];
+  if (!raw) return { configured: false };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { error: `${PROVIDER_ENV} is not valid JSON (expected {payment_type_code: "SBER"|"OZON"|"CASH"|"OTHER"})` };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { error: `${PROVIDER_ENV} must be a JSON object mapping exact payment type codes to providers` };
+  }
+  const map = new Map<string, (typeof PROVIDER_SET)[number]>();
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    // Keys are matched against payments[].type EXACTLY: no trim/folding, and
+    // control characters or oversized codes are rejected as unsafe.
+    if (key === "" || key.length > 128 || hasUnsafeChar(key)) {
+      return { error: `${PROVIDER_ENV}: unsafe payment type code key (empty, >128 chars or control characters)` };
+    }
+    if (typeof value !== "string" || !isProvider(value)) {
+      return { error: `${PROVIDER_ENV}: key "${key}" must map to one of ${PROVIDER_SET.join(", ")}` };
+    }
+    map.set(key, value);
+  }
+  return { configured: true, map };
+}
+
+/**
+ * Canonical payment provider (v6). Evidence is ONLY payments whose exact
+ * status is in the paymentComplete=true reference set — and the container
+ * must be a record of plain non-array objects each carrying an OWN string
+ * `status` (inherited/prototype status is malformed evidence, not skipped).
+ * Non-completed valid entries are ignored. Every completed entry must carry
+ * an OWN exact non-empty `type` present in the explicit map (inherited type
+ * is never evidence), and all completed entries must resolve to ONE
+ * provider. Any malformed container/entry, missing/unmapped type or provider
+ * mix yields UNKNOWN — one malformed sibling can never coexist with a valid
+ * completed payment and still prove a provider. Order status, delivery,
+ * site, sales_channel, labels, timestamps and spelling heuristics never
+ * participate. Raw payment types are never emitted.
+ */
+export function classifyPaymentProvider(payments: unknown, paidStatusCodes: Set<string>, cfg: ProviderMapConfig): PaymentProvider {
+  if (!cfg.configured) return "UNKNOWN";
+  if (payments === undefined || payments === null) return "UNKNOWN";
+  if (typeof payments !== "object" || Array.isArray(payments)) return "UNKNOWN";
+  let provider: (typeof PROVIDER_SET)[number] | null = null;
+  for (const v of Object.values(payments as Record<string, unknown>)) {
+    // Every entry must be a plain non-array object — a malformed sibling
+    // fails the whole classification closed (it is never silently skipped).
+    if (v === null || typeof v !== "object" || Array.isArray(v)) return "UNKNOWN";
+    // Plain object only: the prototype must be exactly Object.prototype or
+    // null. A class instance is structured data, not plain payment evidence.
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) return "UNKNOWN";
+    const p = v as Record<string, unknown>;
+    // OWN string status only: an inherited/prototype "status" is not evidence.
+    if (!hasOwn(p, "status") || typeof p.status !== "string") return "UNKNOWN";
+    // Valid non-completed entries are ignored (they prove nothing either way).
+    if (!paidStatusCodes.has(p.status)) continue;
+    // OWN exact non-empty mapped type: an inherited "type" is not evidence.
+    if (!hasOwn(p, "type") || typeof p.type !== "string" || p.type === "") return "UNKNOWN";
+    const mapped = cfg.map.get(p.type);
+    if (mapped === undefined) return "UNKNOWN";
+    if (provider === null) provider = mapped;
+    else if (provider !== mapped) return "UNKNOWN";
+  }
+  return provider ?? "UNKNOWN";
+}
+
 // ── Sales channel (authoritative customFields.sales_channel) ──
 
 export type Channel = "site" | "phone" | "chat" | "ozon" | "other_marketplace" | "unknown";
@@ -334,7 +422,7 @@ export function deriveChannel(sales: SalesChannelView): { value: Channel; basis:
 
 // ── Shared guard (fail closed before any bridge call) ────────
 
-type AnalyticsGuard = { secret: string; attribution: AttributionConfig; economics: EconomicsConfig };
+type AnalyticsGuard = { secret: string; attribution: AttributionConfig; economics: EconomicsConfig; providerMap: ProviderMapConfig };
 
 function guardConfig(): AnalyticsGuard | { error: string } {
   const secretCheck = checkAnalyticsSecret();
@@ -343,7 +431,9 @@ function guardConfig(): AnalyticsGuard | { error: string } {
   if ("error" in attribution) return attribution;
   const economics = loadEconomicsConfig();
   if ("error" in economics) return economics;
-  return { secret: secretCheck.secret, attribution, economics };
+  const providerMap = loadProviderMapConfig();
+  if ("error" in providerMap) return providerMap;
+  return { secret: secretCheck.secret, attribution, economics, providerMap };
 }
 
 // ── Paid statuses (paymentComplete) ──────────────────────────
@@ -597,6 +687,9 @@ export type AnalyticsOrder = {
   external_id: string | null;
   number: string | null;
   created_at: string | null;
+  // v6: canonical full-payment timestamp for downstream ingestion; paid_at is
+  // the byte-equal compatibility alias. Both come ONLY from order.fullPaidAt.
+  full_paid_at: string | null;
   paid_at: string | null;
   status: string | null;
   order_method: string | null;
@@ -614,12 +707,23 @@ export type AnalyticsOrder = {
   economics: OrderEconomics;
   lifecycle: OrderLifecycle;
   payment_evidence: PaymentEvidence;
+  payment_provider: PaymentProvider;
+  // Downstream paid-profit seam (v6 corrective packet) — payment evidence
+  // only, never fee/profit arithmetic. Non-null only when the proven provider
+  // is SBER and the safely calculated crm_paid_amount is itself non-null.
+  sber_paid_amount_rub: number | null;
+  // Customer-paid delivery charge: delivery.cost copied ONLY when the safe
+  // delivery projection accepted a finite non-negative number. Never derived
+  // from totalSumm, netCost, delivery type or any default.
+  delivery_income_rub: number | null;
   join_key: string | null;
 };
 
 // statusGroups is optional for legacy direct projectOrder callers: an absent
 // map classifies fail-closed to UNKNOWN (never a guessed lifecycle).
-type ProjectionCtx = AnalyticsGuard & { paidStatusCodes: Set<string>; statusGroups?: CrmStatusGroupMap };
+// providerMap is likewise optional for legacy direct callers: an absent map
+// yields payment_provider UNKNOWN (v6 contract: absent configuration is valid).
+type ProjectionCtx = AnalyticsGuard & { paidStatusCodes: Set<string>; statusGroups?: CrmStatusGroupMap; providerMap?: ProviderMapConfig };
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
@@ -786,12 +890,21 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
   const statusCode = typeof o.status === "string" && o.status !== "" ? o.status : null;
   const statusGroup = statusCode !== null ? ctx.statusGroups?.get(statusCode) : undefined;
   const lifecycle = buildLifecycle(statusCode, statusGroup, economics.return_total.value);
+  // Downstream paid-profit seam (v6 corrective packet): payment evidence only.
+  // sber_paid_amount_rub reuses the safely calculated crm_paid_amount ONLY
+  // when the proven provider is SBER (never when UNKNOWN/mixed/non-SBER, and
+  // never when any selected amount was invalid) — the 1.8% acquiring fee and
+  // any profit arithmetic stay downstream. delivery_income_rub copies the
+  // customer-paid delivery.cost ONLY when the safe delivery projection above
+  // accepted a finite non-negative number — never totalSumm/netCost/type/default.
+  const paymentProvider = classifyPaymentProvider(o.payments, ctx.paidStatusCodes, ctx.providerMap ?? { configured: false });
   return {
     order: {
       id: o.id,
       external_id: typeof o.externalId === "string" ? o.externalId : null,
       number: typeof o.number === "string" ? o.number : null,
       created_at: typeof o.createdAt === "string" ? o.createdAt : null,
+      full_paid_at: paidAt,
       paid_at: paidAt,
       status: typeof o.status === "string" ? o.status : null,
       order_method: typeof o.orderMethod === "string" ? o.orderMethod : null,
@@ -810,6 +923,9 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
       economics,
       lifecycle,
       payment_evidence: paymentEvidence,
+      payment_provider: paymentProvider,
+      sber_paid_amount_rub: paymentProvider === "SBER" ? crmPaidAmount : null,
+      delivery_income_rub: delivery !== null ? delivery.cost : null,
       join_key: orderJoinKey(o, ctx.secret),
     },
     // Internal paid pair: ONLY crm_fully_paid (order.fullPaidAt) — never a

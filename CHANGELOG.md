@@ -39,6 +39,14 @@ PII-free SEO-SXO analytics surface (criteria:
   (canonical-key-to-code map; unknown keys, duplicate codes, malformed JSON
   and unsafe tokens fail closed or become `null` with an explicit omission
   reason — nothing is guessed).
+- **Paid-profit ingestion seam (v6 corrective packet).** Every projected
+  analytics order exposes `sber_paid_amount_rub` (the safely calculated
+  `crm_paid_amount` only when the proven `payment_provider` is `SBER`,
+  otherwise `null`; the acquiring fee is never calculated here) and
+  `delivery_income_rub` (the customer-paid `delivery.cost` copied only when
+  the existing safe delivery projection accepted a finite non-negative
+  number; never derived from `totalSumm`, `netCost`, delivery type or
+  defaults). Payment evidence only — no fee, COGS or profit arithmetic.
 
 ### Changed
 - **`orders_history` now honors its `raw` parameter** (criteria #11):
@@ -50,6 +58,15 @@ PII-free SEO-SXO analytics surface (criteria:
   unchanged.
 
 ### Fixed
+- **`classifyPaymentProvider` fails strictly closed (v6 corrective packet).**
+  A provider is proven only when the payments container is a record, every
+  entry is a plain non-array object with an OWN string `status`, valid
+  non-completed entries are ignored, and every completed entry has an OWN
+  exact non-empty mapped string `type`. A malformed sibling (null, primitive,
+  array, missing/inherited `status` or inherited `type`) beside one valid
+  completed payment now yields `UNKNOWN` instead of being silently skipped;
+  prototype properties are never evidence. The separate paid-amount contract
+  is unchanged.
 - **`retailcrm_attribution_fields` scopes its `/custom-fields` request with
   `filter[entity]=order`** so only order metadata is ever requested (never
   other entities' metadata, never field values), and accepts the filtered
