@@ -8,7 +8,7 @@ import { handleOrdersHistory } from "./orders.js";
 import { mockBridge } from "../../tests/bridge-mock.js";
 
 const SECRET = "0123456789abcdef0123456789abcdef"; // 32 chars
-const ENV_KEYS = ["RETAILCRM_ANALYTICS_HMAC_SECRET", "RETAILCRM_ANALYTICS_ATTRIBUTION", "RETAILCRM_ANALYTICS_CHANNEL_MAP", "RETAILCRM_ANALYTICS_ECONOMICS"] as const;
+const ENV_KEYS = ["RETAILCRM_ANALYTICS_HMAC_SECRET", "RETAILCRM_ANALYTICS_ATTRIBUTION", "RETAILCRM_ANALYTICS_CHANNEL_MAP", "RETAILCRM_ANALYTICS_ECONOMICS", "RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP"] as const;
 
 beforeEach(() => {
   process.env.RETAILCRM_DOMAIN = "testshop.retailcrm.ru";
@@ -1454,5 +1454,293 @@ describe("analytics-sxo v5 commercial lifecycle", () => {
     expect(parsed.commercial_result.counts).toEqual({ included: 1, cancelled: 1, returned: 1, unknown: 0 });
     expect(parsed.commercial_result.included_revenue).toBe(1000);
     expect(parsed.commercial_result.returned_amount).toBe(700);
+  });
+});
+
+describe("analytics-sxo paid-profit ingestion contract (v6: AC-1, AC-2)", () => {
+  const installOrders = (orders: unknown[]) => {
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200,
+        data: { success: true, generatedAt: "2026-09-01T00:00:00", orders, pagination: { currentPage: 1, totalPageCount: 1, totalCount: orders.length } },
+      };
+    });
+    return bridge;
+  };
+
+  it("AC-1: full_paid_at mirrors order.fullPaidAt alongside paid_at; both null when absent regardless of status", async () => {
+    installOrders([
+      // Non-empty fullPaidAt: exact value as BOTH full_paid_at and paid_at.
+      { id: 1, status: "complete", items: [], fullPaidAt: "2026-07-02T09:00:00", payments: { a: { type: "cash", status: "paid", paidAt: "2026-07-01T12:00:00" } } },
+      // Absent fullPaidAt but completed payment paidAt and "complete" status: both null.
+      { id: 2, status: "complete", items: [], payments: { a: { type: "cash", status: "paid", paidAt: "2026-07-03T08:30:00" } } },
+      // Absent fullPaidAt, non-complete payment, "new" status: both null.
+      { id: 3, status: "new", items: [], payments: { a: { type: "cash", status: "pending", paidAt: "2026-07-03T09:00:00" } } },
+      // Empty-string fullPaidAt: both null.
+      { id: 4, status: "complete", items: [], fullPaidAt: "" },
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 })).text);
+    expect(parsed.orders.map((o: { id: number; full_paid_at: string | null; paid_at: string | null }) => [o.id, o.full_paid_at, o.paid_at])).toEqual([
+      [1, "2026-07-02T09:00:00", "2026-07-02T09:00:00"],
+      [2, null, null],
+      [3, null, null],
+      [4, null, null],
+    ]);
+  });
+
+  it("AC-2: payment_provider is UNKNOWN until completed-payment evidence is explicitly mapped, and raw types never leak", async () => {
+    // No provider map configured: even a single completed mapped-looking payment yields UNKNOWN.
+    installOrders([
+      { id: 1, status: "complete", items: [], fullPaidAt: "2026-07-02T09:00:00", payments: { a: { type: "cash", status: "paid", amount: 100 } } },
+    ]);
+    const unmapped = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 })).text);
+    expect(unmapped.orders[0].payment_provider).toBe("UNKNOWN");
+    expect(unmapped.text ?? JSON.stringify(unmapped)).not.toContain("cash");
+
+    // Explicit map: one completed payment with an exactly mapped type proves the provider.
+    process.env.RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP = JSON.stringify({ cash: "CASH", "sber-ru": "SBER" });
+    installOrders([
+      { id: 1, status: "complete", items: [], fullPaidAt: "2026-07-02T09:00:00", payments: { a: { type: "cash", status: "paid", amount: 100 }, b: { type: "cash", status: "paid", amount: 50 } } },
+      // Mixed providers among completed payments => UNKNOWN.
+      { id: 2, status: "complete", items: [], payments: { a: { type: "cash", status: "paid", amount: 100 }, b: { type: "sber-ru", status: "paid", amount: 50 } } },
+      // Unmapped type on the only completed payment => UNKNOWN, raw type not emitted.
+      { id: 3, status: "complete", items: [], payments: { a: { type: "qiwisomething", status: "paid", amount: 100 } } },
+      // Non-complete payment with a mapped type never proves a provider.
+      { id: 4, status: "complete", items: [], payments: { a: { type: "cash", status: "pending", amount: 100 } } },
+    ]);
+    const mapped = JSON.parse((await handleOrdersAnalytics({ date_from: "2026-08-01", date_to: "2026-08-31", max_pages: 1, max_orders: 10 })).text);
+    expect(mapped.orders.map((o: { id: number; payment_provider: string }) => [o.id, o.payment_provider])).toEqual([
+      [1, "CASH"],
+      [2, "UNKNOWN"],
+      [3, "UNKNOWN"],
+      [4, "UNKNOWN"],
+    ]);
+    expect(JSON.stringify(mapped)).not.toContain("qiwisomething");
+  });
+});
+
+describe("analytics-sxo payment-provider fail-closed classification (v6 corrective packet)", () => {
+  const WINDOW = { date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 } as const;
+
+  const installOrders = (orders: unknown[]) => {
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200,
+        data: { success: true, generatedAt: "2026-09-01T00:00:00", orders, pagination: { currentPage: 1, totalPageCount: 1, totalCount: orders.length } },
+      };
+    });
+    return bridge;
+  };
+
+  it("malformed provider-map configuration fails closed before the bridge is called", async () => {
+    process.env.RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP = "{not json";
+    const bridge = mockBridge([]);
+    const r = await handleOrdersAnalytics({ ...WINDOW });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP");
+    expect(bridge.calls.length).toBe(0); // configuration rejected before any bridge call
+
+    process.env.RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP = JSON.stringify({ bad: "NOT_A_PROVIDER" });
+    const bridge2 = mockBridge([]);
+    const r2 = await handleOrdersAnalytics({ ...WINDOW });
+    expect(r2.isError).toBe(true);
+    expect(r2.text).toContain("RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP");
+    expect(bridge2.calls.length).toBe(0);
+  });
+
+  it("a malformed payments entry plus a valid completed payment yields UNKNOWN (no skip-and-prove)", async () => {
+    process.env.RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP = JSON.stringify({ "sber-ru": "SBER" });
+    installOrders([
+      // A null sibling beside a valid completed payment must fail the whole classification.
+      { id: 1, status: "complete", items: [], payments: { bad: null, good: { type: "sber-ru", status: "paid", amount: 100 } } },
+      // A primitive sibling: same fail-closed rule.
+      { id: 2, status: "complete", items: [], payments: { bad: 42, good: { type: "sber-ru", status: "paid", amount: 100 } } },
+      // An array sibling: same fail-closed rule.
+      { id: 3, status: "complete", items: [], payments: { bad: [1, 2], good: { type: "sber-ru", status: "paid", amount: 100 } } },
+      // An entry without any own status property: malformed, never skipped.
+      { id: 4, status: "complete", items: [], payments: { bad: {}, good: { type: "sber-ru", status: "paid", amount: 100 } } },
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics({ ...WINDOW })).text);
+    expect(parsed.orders.map((o: { id: number; payment_provider: string }) => [o.id, o.payment_provider])).toEqual([
+      [1, "UNKNOWN"],
+      [2, "UNKNOWN"],
+      [3, "UNKNOWN"],
+      [4, "UNKNOWN"],
+    ]);
+  });
+
+  it("inherited status or inherited type is never evidence", async () => {
+    process.env.RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP = JSON.stringify({ "sber-ru": "SBER" });
+    // A payment object whose status comes from its prototype (own "status" absent)
+    // is malformed: a valid completed sibling cannot prove a provider.
+    const inheritedStatus = Object.assign(Object.create({ status: "paid" }), { type: "sber-ru" });
+    // A completed entry whose type comes from its prototype (own "type" absent)
+    // has no own exact mapped type: UNKNOWN, raw prototype type never emitted.
+    const inheritedType = Object.assign(Object.create({ type: "sber-ru" }), { status: "paid" });
+    installOrders([
+      { id: 1, status: "complete", items: [], payments: { a: inheritedStatus, good: { type: "sber-ru", status: "paid", amount: 100 } } },
+      { id: 2, status: "complete", items: [], payments: { a: inheritedType } },
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics({ ...WINDOW })).text);
+    expect(parsed.orders.map((o: { id: number; payment_provider: string }) => [o.id, o.payment_provider])).toEqual([
+      [1, "UNKNOWN"],
+      [2, "UNKNOWN"],
+    ]);
+  });
+
+  it("a class instance payment with own completed status/type cannot prove SBER, even beside a valid plain completed SBER sibling", async () => {
+    process.env.RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP = JSON.stringify({ "sber-ru": "SBER" });
+    class Payment {
+      status: string;
+      type: string;
+      amount: number;
+      constructor(status: string, type: string, amount: number) {
+        this.status = status; // own property
+        this.type = type; // own property
+        this.amount = amount; // own valid amount
+      }
+    }
+    const instance = new Payment("paid", "sber-ru", 100);
+    installOrders([
+      // Own completed status, own mapped type, own valid amount — but a class
+      // prototype, so it is NOT a plain payment entry: UNKNOWN.
+      { id: 1, status: "complete", items: [], payments: { a: instance } },
+      // The same class instance beside a valid plain completed SBER sibling:
+      // the malformed sibling fails the whole classification closed.
+      { id: 2, status: "complete", items: [], payments: { a: instance, good: { type: "sber-ru", status: "paid", amount: 100 } } },
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics({ ...WINDOW })).text);
+    expect(parsed.orders.map((o: { id: number; payment_provider: string }) => [o.id, o.payment_provider])).toEqual([
+      [1, "UNKNOWN"],
+      [2, "UNKNOWN"],
+    ]);
+    expect(parsed.orders.map((o: { sber_paid_amount_rub: number | null }) => o.sber_paid_amount_rub)).toEqual([null, null]);
+  });
+
+  it("valid pending payments do not affect a valid completed provider; raw types still never appear", async () => {
+    process.env.RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP = JSON.stringify({ "sber-ru": "SBER", cash: "CASH" });
+    installOrders([
+      // A valid pending entry (own string status, not completed) is ignored: the
+      // completed SBER payment still proves SBER. Its unmapped-looking raw type
+      // is never selected and never emitted.
+      {
+        id: 1, status: "complete", items: [],
+        payments: {
+          pendingOne: { type: "weird-unmapped-type", status: "pending", amount: 0 },
+          paidOne: { type: "sber-ru", status: "paid", amount: 100 },
+        },
+      },
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics({ ...WINDOW })).text);
+    expect(parsed.orders[0].payment_provider).toBe("SBER");
+    expect(JSON.stringify(parsed)).not.toContain("weird-unmapped-type");
+  });
+});
+
+describe("analytics-sxo sber_paid_amount_rub seam (v6 corrective packet)", () => {
+  const WINDOW = { date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 } as const;
+
+  const installOrders = (orders: unknown[]) => {
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200,
+        data: { success: true, generatedAt: "2026-09-01T00:00:00", orders, pagination: { currentPage: 1, totalPageCount: 1, totalCount: orders.length } },
+      };
+    });
+    return bridge;
+  };
+
+  it("is the safely calculated crm_paid_amount only when payment_provider is SBER", async () => {
+    process.env.RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP = JSON.stringify({ "sber-ru": "SBER", cash: "CASH" });
+    installOrders([
+      // Proven SBER with two completed SBER payments: summed safe amount.
+      { id: 1, status: "complete", items: [], payments: { a: { type: "sber-ru", status: "paid", amount: 100.5 }, b: { type: "sber-ru", status: "paid", amount: 49.5 } } },
+      // Proven CASH: null even though the paid amount is known.
+      { id: 2, status: "complete", items: [], payments: { a: { type: "cash", status: "paid", amount: 200 } } },
+      // Mixed completed providers => provider UNKNOWN => null.
+      { id: 3, status: "complete", items: [], payments: { a: { type: "sber-ru", status: "paid", amount: 100 }, b: { type: "cash", status: "paid", amount: 50 } } },
+      // Unmapped completed type => provider UNKNOWN => null, raw type not emitted.
+      { id: 4, status: "complete", items: [], payments: { a: { type: "unknown-type", status: "paid", amount: 100 } } },
+      // No payments at all => UNKNOWN => null.
+      { id: 5, status: "complete", items: [] },
+      // Proven SBER but one completed amount is invalid => crm_paid_amount null => null (never a partial sum).
+      { id: 6, status: "complete", items: [], payments: { a: { type: "sber-ru", status: "paid", amount: 100 }, b: { type: "sber-ru", status: "paid", amount: -1 } } },
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics({ ...WINDOW })).text);
+    expect(parsed.orders.map((o: { id: number; sber_paid_amount_rub: number | null; payment_provider: string }) => [o.id, o.payment_provider, o.sber_paid_amount_rub])).toEqual([
+      [1, "SBER", 150],
+      [2, "CASH", null],
+      [3, "UNKNOWN", null],
+      [4, "UNKNOWN", null],
+      [5, "UNKNOWN", null],
+      [6, "SBER", null],
+    ]);
+    expect(parsed.orders[0].sber_paid_amount_rub).toBe(parsed.orders[0].payment_evidence.crm_paid_amount);
+    expect(JSON.stringify(parsed)).not.toContain("unknown-type");
+  });
+
+  it("is null for every order when no provider map is configured (UNKNOWN)", async () => {
+    delete process.env.RETAILCRM_ANALYTICS_PAYMENT_PROVIDER_MAP;
+    installOrders([
+      { id: 1, status: "complete", items: [], payments: { a: { type: "sber-ru", status: "paid", amount: 100 } } },
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics({ ...WINDOW })).text);
+    expect(parsed.orders[0].payment_provider).toBe("UNKNOWN");
+    expect(parsed.orders[0].sber_paid_amount_rub).toBeNull();
+  });
+});
+
+describe("analytics-sxo delivery_income_rub seam (v6 corrective packet)", () => {
+  const WINDOW = { date_from: "2026-07-01", date_to: "2026-07-31", max_pages: 1, max_orders: 10 } as const;
+
+  const installOrders = (orders: unknown[]) => {
+    const bridge = mockBridge([]);
+    bridge.implement(req => {
+      if (req.path === "/reference/payment-statuses") return paidStatusPage;
+      return {
+        v: 1, ok: true, status: 200,
+        data: { success: true, generatedAt: "2026-09-01T00:00:00", orders, pagination: { currentPage: 1, totalPageCount: 1, totalCount: orders.length } },
+      };
+    });
+    return bridge;
+  };
+
+  it("is delivery.cost only when the safe projection accepted a finite non-negative number; missing/malformed are null", async () => {
+    installOrders([
+      // Present finite non-negative cost: copied exactly (zero is a valid known charge).
+      { id: 1, status: "complete", items: [], totalSumm: 2000, delivery: { code: "courier", cost: 350, netCost: 250 } },
+      { id: 2, status: "complete", items: [], totalSumm: 2000, delivery: { code: "pickup", cost: 0 } },
+      // Missing delivery container entirely: null.
+      { id: 3, status: "complete", items: [], totalSumm: 2000 },
+      // Delivery present but cost absent: null (never derived from totalSumm/netCost).
+      { id: 4, status: "complete", items: [], totalSumm: 2000, delivery: { code: "courier", netCost: 250 } },
+      // Malformed costs — negative, non-number, NaN-like string, Infinity: all null.
+      { id: 5, status: "complete", items: [], totalSumm: 2000, delivery: { code: "courier", cost: -10 } },
+      { id: 6, status: "complete", items: [], totalSumm: 2000, delivery: { code: "courier", cost: "350" } },
+      { id: 7, status: "complete", items: [], totalSumm: 2000, delivery: { code: "courier", cost: Number.NaN } },
+      { id: 8, status: "complete", items: [], totalSumm: 2000, delivery: { code: "courier", cost: Infinity } },
+    ]);
+    const parsed = JSON.parse((await handleOrdersAnalytics({ ...WINDOW })).text);
+    expect(parsed.orders.map((o: { id: number; delivery_income_rub: number | null }) => [o.id, o.delivery_income_rub])).toEqual([
+      [1, 350],
+      [2, 0],
+      [3, null],
+      [4, null],
+      [5, null],
+      [6, null],
+      [7, null],
+      [8, null],
+    ]);
+    // The copied value is exactly the safe delivery projection's cost.
+    expect(parsed.orders[0].delivery_income_rub).toBe(parsed.orders[0].delivery.cost);
+    // Never derived from totalSumm (2000) or netCost (250).
+    expect(parsed.orders.map((o: { delivery_income_rub: number | null }) => o.delivery_income_rub)).not.toContain(2000);
+    expect(parsed.orders.map((o: { delivery_income_rub: number | null }) => o.delivery_income_rub)).not.toContain(250);
   });
 });
