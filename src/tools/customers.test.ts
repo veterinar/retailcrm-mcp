@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   handleListCustomers, handleGetCustomer, handleCreateCustomer,
   handleUpdateCustomer, handleMergeCustomers, handleCustomersHistory,
+  handleGetCustomerFieldDefinitions, getCustomerFieldDefinitionsSchema,
   getCustomerSchema, listCustomersSchema, customersHistorySchema,
 } from "./customers.js";
 import { mockBridge } from "../../tests/bridge-mock.js";
@@ -70,6 +71,43 @@ describe("handleGetCustomer", () => {
     const req = bridge.first();
     expect(req.path).toBe("/customers/EXT-5");
     expect(req.params).toEqual({ by: "externalId" });
+  });
+});
+
+describe("handleGetCustomerFieldDefinitions", () => {
+  it("requests customer metadata only, returns requested fields, omits values, and reports unmatched codes", async () => {
+    const secretValue = "must-not-be-returned";
+    const bridge = mockBridge([{
+      customFields: [
+        { code: "customer2dc3445a905c", name: "Consent", type: "checkbox", entity: "customer", value: secretValue },
+        { code: "customer379a31661a00", name: "Import note", type: "text", entity: "customer", value: secretValue },
+        { code: "unrequested", name: "Other", type: "text", entity: "customer", value: secretValue },
+        { code: "order-only", name: "Other entity", type: "text", entity: "order", value: secretValue },
+      ],
+    }]);
+    const result = await handleGetCustomerFieldDefinitions({ codes: ["customer2dc3445a905c", "order-only", "missing"] });
+    expect(bridge.first()?.path).toBe("/custom-fields");
+    expect(bridge.first()?.params).toEqual({ "filter[entity]": "customer" });
+    expect(JSON.parse(result.text)).toEqual({
+      fields: [{ code: "customer2dc3445a905c", name: "Consent", type: "checkbox", entity: "customer" }],
+      unmatched_codes: ["order-only", "missing"],
+    });
+    expect(result.text).not.toContain(secretValue);
+  });
+
+  it("supports code-keyed metadata maps and enforces the bounded code list", async () => {
+    const bridge = mockBridge([{ customFields: { customer379a31661a00: { name: "Consent source", type: "text" } } }]);
+    const result = await handleGetCustomerFieldDefinitions({ codes: ["customer379a31661a00"] });
+    expect(bridge.first()?.params).toEqual({ "filter[entity]": "customer" });
+    expect(JSON.parse(result.text)).toEqual({
+      fields: [{ code: "customer379a31661a00", name: "Consent source", type: "text", entity: "customer" }],
+      unmatched_codes: [],
+    });
+    expect(getCustomerFieldDefinitionsSchema.safeParse({ codes: ["x"] }).success).toBe(true);
+    expect(getCustomerFieldDefinitionsSchema.safeParse({ codes: [] }).success).toBe(false);
+    expect(getCustomerFieldDefinitionsSchema.safeParse({ codes: [""] }).success).toBe(false);
+    expect(getCustomerFieldDefinitionsSchema.safeParse({ codes: ["x".repeat(129)] }).success).toBe(false);
+    expect(getCustomerFieldDefinitionsSchema.safeParse({ codes: Array(21).fill("x") }).success).toBe(false);
   });
 });
 

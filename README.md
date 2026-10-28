@@ -1,6 +1,6 @@
 # retailcrm-mcp
 
-Production-grade MCP server for **RetailCRM** e-commerce CRM. **44 tools** + 2 prompt skills for managing orders, customers, products, inventory, payments, tasks, references, and analytics via API v5.
+Production-grade MCP server for **RetailCRM** e-commerce CRM. **45 tools** + 2 prompt skills for managing orders, customers, products, inventory, payments, tasks, references, and analytics via API v5.
 
 API traffic is transported by the official [`retailcrm/api-client-php`](https://github.com/retailcrm/api-client-php) client, pinned to **6.15.32**, invoked from Node through a PHP bridge (`bin/retailcrm-api.php`). The server ships as a self-contained Docker image — no host PHP or Composer required.
 
@@ -20,7 +20,7 @@ Read tools return a **compact, shaped summary** of only the fields an agent need
 
 `customers_history` is an exception: it always returns provider history entries and pagination; its compatibility `raw` parameter does not change the output. Use `filter_customer_id` to keep a read scoped to one customer.
 
-## Tools (44)
+## Tools (45)
 
 ### Orders
 | Tool | Description |
@@ -36,6 +36,7 @@ Read tools return a **compact, shaped summary** of only the fields an agent need
 |------|-------------|
 | `list_customers` | Search customers by name, email, phone, date; v5 limit 20/50/100 (default 20) |
 | `get_customer` | Get one customer by internal ID (`by=id`, default) or externalId (`by=externalId`) |
+| `get_customer_field_definitions` | Look up selected customer custom-field definitions by code; returns metadata only, never values |
 | `create_customer` | Create a customer |
 | `update_customer` | Edit an existing customer |
 | `merge_customers` | Merge duplicates (destructive) |

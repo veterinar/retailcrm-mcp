@@ -63,6 +63,8 @@ const TOOLS: ToolDef[] = [
     "List/search customers by name, email, phone, created-date. RetailCRM v5 accepts limit 20, 50, or 100 (default 20). Returns (summary): pagination + array of {id, name, email, phone, ordersCount, totalSpent}. detail:'full' adds address/externalId/all phones."),
   def("get_customer", "Get Customer", "read", customers.getCustomerSchema, customers.handleGetCustomer,
     "Get one customer by internal RetailCRM ID (default; sends by=id) or externalId (by=externalId). Returns a shaped customer; detail:'full' adds address and contact details."),
+  def("get_customer_field_definitions", "Get Customer Field Definitions", "read", customers.getCustomerFieldDefinitionsSchema, customers.handleGetCustomerFieldDefinitions,
+    "Look up selected CUSTOMER custom-field metadata by code. Returns only code/name/type/entity and unmatched_codes; never field values."),
   def("create_customer", "Create Customer", "write", customers.createCustomerSchema, customers.handleCreateCustomer,
     "Create a customer with name, contacts, address, optional externalId. Returns {success, id}."),
   def("update_customer", "Update Customer", "write", customers.updateCustomerSchema, customers.handleUpdateCustomer,

@@ -50,6 +50,55 @@ export async function handleGetCustomer(params: z.infer<typeof getCustomerSchema
   });
 }
 
+// ── customer custom-field definitions (metadata only) ────────
+export const getCustomerFieldDefinitionsSchema = z.object({
+  codes: z.array(z.string().min(1).max(128)).min(1).max(20)
+    .describe("Customer custom-field codes to look up (1–20 codes, each 1–128 characters)"),
+});
+
+export async function handleGetCustomerFieldDefinitions(params: z.infer<typeof getCustomerFieldDefinitionsSchema>): Promise<ToolResult> {
+  return runTool(async () => {
+    const resp = await retailCrmGet("/custom-fields", { "filter[entity]": "customer" }) as { customFields?: unknown };
+    const rawFields = resp?.customFields;
+    if (rawFields === null || typeof rawFields !== "object") {
+      throw new Error("RetailCRM /custom-fields response is malformed (customFields container missing)");
+    }
+    const arrayForm = Array.isArray(rawFields);
+    const entries: [string, unknown][] = arrayForm
+      ? rawFields.map((entry, index): [string, unknown] => [String(index), entry])
+      : Object.entries(rawFields as Record<string, unknown>);
+    const requested = [...new Set(params.codes)];
+    const requestedCodes = new Set(requested);
+    const fields = new Map<string, { code: string; name: string | null; type: string | null; entity: string }>();
+    for (const [key, entry] of entries) {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error(`RetailCRM customer custom field metadata at ${key} is malformed`);
+      }
+      const field = entry as { code?: unknown; name?: unknown; type?: unknown; entity?: unknown };
+      if (arrayForm && (typeof field.code !== "string" || field.code === "")) {
+        throw new Error(`RetailCRM customer custom field metadata at array index ${key} has no code`);
+      }
+      if (field.entity !== undefined && typeof field.entity !== "string") {
+        throw new Error(`RetailCRM customer custom field metadata at ${key} has malformed entity`);
+      }
+      if (field.entity !== undefined && field.entity !== "customer") continue;
+      const code = typeof field.code === "string" && field.code !== "" ? field.code : key;
+      if (!requestedCodes.has(code)) continue;
+      if (fields.has(code)) throw new Error("RetailCRM returned duplicate customer custom field metadata");
+      fields.set(code, {
+        code,
+        name: typeof field.name === "string" ? field.name : null,
+        type: typeof field.type === "string" ? field.type : null,
+        entity: "customer",
+      });
+    }
+    return ok({
+      fields: requested.flatMap(code => fields.has(code) ? [fields.get(code)!] : []),
+      unmatched_codes: requested.filter(code => !fields.has(code)),
+    });
+  });
+}
+
 // ── create_customer ──────────────────────────────────────────
 export const createCustomerSchema = z.object({
   first_name: z.string().describe("Customer first name"),
