@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   handleListCustomers, handleGetCustomer, handleCreateCustomer,
-  handleUpdateCustomer, handleMergeCustomers, getCustomerSchema, listCustomersSchema,
+  handleUpdateCustomer, handleMergeCustomers, handleCustomersHistory,
+  getCustomerSchema, listCustomersSchema, customersHistorySchema,
 } from "./customers.js";
 import { mockBridge } from "../../tests/bridge-mock.js";
 
@@ -69,6 +70,32 @@ describe("handleGetCustomer", () => {
     const req = bridge.first();
     expect(req.path).toBe("/customers/EXT-5");
     expect(req.params).toEqual({ by: "externalId" });
+  });
+});
+
+describe("handleCustomersHistory", () => {
+  it("filters to a customer ID and preserves ordinary pagination and date filters", async () => {
+    const bridge = mockBridge([{ success: true, history: [], pagination: { totalCount: 0 } }]);
+    await handleCustomersHistory({ filter_customer_id: 42, filter_date_from: "2026-01-01", filter_date_to: "2026-01-31", page: 2, limit: 50 });
+    expect(bridge.first()?.path).toBe("/customers/history");
+    expect(bridge.first()?.params).toEqual({
+      limit: "50", page: "2", "filter[customerId]": "42",
+      "filter[startDate]": "2026-01-01", "filter[endDate]": "2026-01-31",
+    });
+    expect(customersHistorySchema.safeParse({ filter_customer_id: 1 }).success).toBe(true);
+    expect(customersHistorySchema.safeParse({ filter_customer_id: 0 }).success).toBe(false);
+    expect(customersHistorySchema.safeParse({ filter_customer_id: 4_294_967_296 }).success).toBe(false);
+  });
+
+  it("omits page for sinceId cursor calls while preserving customer/date/limit filters", async () => {
+    const bridge = mockBridge([{ success: true, history: [], pagination: { totalCount: 0 } }]);
+    await handleCustomersHistory({ filter_since_id: 10, filter_customer_id: 42, filter_date_from: "2026-01-01", page: 3, limit: 100 });
+    const params = bridge.first()?.params ?? {};
+    expect(params).toEqual({
+      limit: "100", "filter[sinceId]": "10", "filter[customerId]": "42",
+      "filter[startDate]": "2026-01-01",
+    });
+    expect("page" in params).toBe(false);
   });
 });
 

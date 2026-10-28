@@ -18,6 +18,8 @@ Read tools return a **compact, shaped summary** of only the fields an agent need
 
 > ⚠️ **v3 was a breaking change** vs v2: default output is the shaped summary instead of raw JSON. Pass `raw:true` to restore the old payload.
 
+`customers_history` is an exception: it always returns provider history entries and pagination; its compatibility `raw` parameter does not change the output. Use `filter_customer_id` to keep a read scoped to one customer.
+
 ## Tools (44)
 
 ### Orders
@@ -37,7 +39,7 @@ Read tools return a **compact, shaped summary** of only the fields an agent need
 | `create_customer` | Create a customer |
 | `update_customer` | Edit an existing customer |
 | `merge_customers` | Merge duplicates (destructive) |
-| `customers_history` | Customer change log (growth/churn, incremental sync) |
+| `customers_history` | Customer change history by internal ID/date; incremental cursor calls omit `page` |
 
 For RetailCRM v5, `list_orders.filter_status` accepts a status code or status-group token and maps to `filter[extendedStatus][]`. The get endpoints default to `by=externalId`; this MCP defaults to the internal ID and sends `by=id`, while external IDs require `by=externalId`. The [official API v5 reference](https://docs.simla.com/developers/api/api-versions/api-v5/) documents limits 20/50/100 (default 20), the `filter[extendedStatus][]` values, `customer.id` as an integer, `customer.externalId` as a string, and `customer.browserId` as a separate Daemon Collector identifier.
 

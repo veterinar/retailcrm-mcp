@@ -70,7 +70,7 @@ const TOOLS: ToolDef[] = [
   def("merge_customers", "Merge Customers", "destructive", customers.mergeCustomersSchema, customers.handleMergeCustomers,
     "Merge duplicate customers into a target; merged records are DELETED. Returns {success}."),
   def("customers_history", "Customers History", "read", customers.customersHistorySchema, customers.handleCustomersHistory,
-    "Customer field-change log for growth/churn signals and incremental sync. Returns {history[], pagination}."),
+    "Customer field-change history with per-customer ID/date filters and incremental sync. Cursor calls with filter_since_id omit page. Returns {history[], pagination}."),
 
   // ── Products / catalog ──
   def("list_products", "List Products", "read", products.listProductsSchema, products.handleListProducts,

@@ -140,6 +140,7 @@ export async function handleMergeCustomers(params: z.infer<typeof mergeCustomers
 // ── customers_history ────────────────────────────────────────
 export const customersHistorySchema = z.object({
   filter_since_id: z.number().int().optional().describe("Return changes after this history entry ID (incremental sync)"),
+  filter_customer_id: z.number().int().positive().max(4_294_967_295).optional().describe("Restrict history to one internal RetailCRM customer ID"),
   filter_date_from: dateField("Changes on/after this date (YYYY-MM-DD)").optional(),
   filter_date_to: dateField("Changes on/before this date (YYYY-MM-DD)").optional(),
   raw: rawField,
@@ -149,8 +150,10 @@ export const customersHistorySchema = z.object({
 
 export async function handleCustomersHistory(params: z.infer<typeof customersHistorySchema>): Promise<ToolResult> {
   return runTool(async () => {
-    const query: Record<string, string> = { page: String(params.page), limit: String(params.limit) };
+    const query: Record<string, string> = { limit: String(params.limit) };
     if (params.filter_since_id !== undefined) query["filter[sinceId]"] = String(params.filter_since_id);
+    else query.page = String(params.page);
+    if (params.filter_customer_id !== undefined) query["filter[customerId]"] = String(params.filter_customer_id);
     if (params.filter_date_from) query["filter[startDate]"] = params.filter_date_from;
     if (params.filter_date_to) query["filter[endDate]"] = params.filter_date_to;
     const result = await retailCrmGet("/customers/history", query);
