@@ -6,6 +6,8 @@ import type { RawCustomer } from "../types.js";
 
 // ── list_customers ───────────────────────────────────────────
 export const listCustomersSchema = z.object({
+  filter_ids: z.array(z.number().int().positive()).min(1).max(100).optional()
+    .describe("Restrict the list to these internal RetailCRM customer IDs (at most 100 IDs per MCP call)"),
   filter_name: z.string().optional().describe("Filter by customer name (partial match)"),
   filter_email: z.string().optional().describe("Filter by email address"),
   filter_phone: z.string().optional().describe("Filter by phone number"),
@@ -20,6 +22,7 @@ export const listCustomersSchema = z.object({
 export async function handleListCustomers(params: z.infer<typeof listCustomersSchema>): Promise<ToolResult> {
   return runTool(async () => {
     const query: Record<string, string> = { page: String(params.page), limit: String(params.limit) };
+    params.filter_ids?.forEach((id, index) => { query[`filter[ids][${index}]`] = String(id); });
     if (params.filter_name) query["filter[name]"] = params.filter_name;
     if (params.filter_email) query["filter[email]"] = params.filter_email;
     if (params.filter_phone) query["filter[phone]"] = params.filter_phone;
@@ -42,12 +45,60 @@ export const getCustomerSchema = z.object({
 
 export async function handleGetCustomer(params: z.infer<typeof getCustomerSchema>): Promise<ToolResult> {
   return runTool(async () => {
-    const query: Record<string, string> = {};
-    if (params.by === "externalId") query["by"] = "externalId";
+    const query: Record<string, string> = { by: params.by };
     const result = await retailCrmGet(`/customers/${encodeURIComponent(params.id)}`, query) as { customer?: RawCustomer };
     if (params.raw || !result?.customer) return ok(result);
     const view = params.detail === "full" ? toCustomerView(result.customer) : toCustomerSummary(result.customer);
     return ok({ customer: view });
+  });
+}
+
+// ── customer custom-field definitions (metadata only) ────────
+export const getCustomerFieldDefinitionsSchema = z.object({
+  codes: z.array(z.string().min(1).max(128)).min(1).max(20)
+    .describe("Customer custom-field codes to look up (1–20 codes, each 1–128 characters)"),
+});
+
+export async function handleGetCustomerFieldDefinitions(params: z.infer<typeof getCustomerFieldDefinitionsSchema>): Promise<ToolResult> {
+  return runTool(async () => {
+    const resp = await retailCrmGet("/custom-fields", { "filter[entity]": "customer" }) as { customFields?: unknown };
+    const rawFields = resp?.customFields;
+    if (rawFields === null || typeof rawFields !== "object") {
+      throw new Error("RetailCRM /custom-fields response is malformed (customFields container missing)");
+    }
+    const arrayForm = Array.isArray(rawFields);
+    const entries: [string, unknown][] = arrayForm
+      ? rawFields.map((entry, index): [string, unknown] => [String(index), entry])
+      : Object.entries(rawFields as Record<string, unknown>);
+    const requested = [...new Set(params.codes)];
+    const requestedCodes = new Set(requested);
+    const fields = new Map<string, { code: string; name: string | null; type: string | null; entity: string }>();
+    for (const [key, entry] of entries) {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error(`RetailCRM customer custom field metadata at ${key} is malformed`);
+      }
+      const field = entry as { code?: unknown; name?: unknown; type?: unknown; entity?: unknown };
+      if (arrayForm && (typeof field.code !== "string" || field.code === "")) {
+        throw new Error(`RetailCRM customer custom field metadata at array index ${key} has no code`);
+      }
+      if (field.entity !== undefined && typeof field.entity !== "string") {
+        throw new Error(`RetailCRM customer custom field metadata at ${key} has malformed entity`);
+      }
+      if (field.entity !== undefined && field.entity !== "customer") continue;
+      const code = typeof field.code === "string" && field.code !== "" ? field.code : key;
+      if (!requestedCodes.has(code)) continue;
+      if (fields.has(code)) throw new Error("RetailCRM returned duplicate customer custom field metadata");
+      fields.set(code, {
+        code,
+        name: typeof field.name === "string" ? field.name : null,
+        type: typeof field.type === "string" ? field.type : null,
+        entity: "customer",
+      });
+    }
+    return ok({
+      fields: requested.flatMap(code => fields.has(code) ? [fields.get(code)!] : []),
+      unmatched_codes: requested.filter(code => !fields.has(code)),
+    });
   });
 }
 
@@ -141,6 +192,7 @@ export async function handleMergeCustomers(params: z.infer<typeof mergeCustomers
 // ── customers_history ────────────────────────────────────────
 export const customersHistorySchema = z.object({
   filter_since_id: z.number().int().optional().describe("Return changes after this history entry ID (incremental sync)"),
+  filter_customer_id: z.number().int().positive().max(4_294_967_295).optional().describe("Restrict history to one internal RetailCRM customer ID"),
   filter_date_from: dateField("Changes on/after this date (YYYY-MM-DD)").optional(),
   filter_date_to: dateField("Changes on/before this date (YYYY-MM-DD)").optional(),
   raw: rawField,
@@ -150,8 +202,10 @@ export const customersHistorySchema = z.object({
 
 export async function handleCustomersHistory(params: z.infer<typeof customersHistorySchema>): Promise<ToolResult> {
   return runTool(async () => {
-    const query: Record<string, string> = { page: String(params.page), limit: String(params.limit) };
+    const query: Record<string, string> = { limit: String(params.limit) };
     if (params.filter_since_id !== undefined) query["filter[sinceId]"] = String(params.filter_since_id);
+    else query.page = String(params.page);
+    if (params.filter_customer_id !== undefined) query["filter[customerId]"] = String(params.filter_customer_id);
     if (params.filter_date_from) query["filter[startDate]"] = params.filter_date_from;
     if (params.filter_date_to) query["filter[endDate]"] = params.filter_date_to;
     const result = await retailCrmGet("/customers/history", query);

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { handleListOrders, handleGetOrder, handleCreateOrder, handleUpdateOrder } from "./orders.js";
+import { handleListOrders, handleGetOrder, handleCreateOrder, handleUpdateOrder, getOrderSchema, listOrdersSchema } from "./orders.js";
 import { mockBridge } from "../../tests/bridge-mock.js";
 
 beforeEach(() => {
@@ -14,15 +14,46 @@ afterEach(() => {
 describe("handleListOrders", () => {
   it("sends correct filter params to the bridge", async () => {
     const bridge = mockBridge([{ success: true, orders: [], pagination: { totalCount: 0 } }]);
-    await handleListOrders({ filter_status: "complete", filter_date_from: "2025-01-01", detail: "summary", page: 1, limit: 10 });
+    await handleListOrders({ filter_status: "complete", filter_date_from: "2025-01-01", detail: "summary", page: 1, limit: 20 });
     const req = bridge.first();
     expect(req.op).toBe("get");
     expect(req.path).toBe("/orders");
     expect(req.params).toMatchObject({
-      "filter[status]": "complete",
+      "filter[extendedStatus][]": "complete",
       "filter[createdAtFrom]": "2025-01-01",
-      limit: "10",
+      page: "1",
+      limit: "20",
     });
+    expect(req.params).not.toHaveProperty("filter[status]");
+    expect(req.params).not.toHaveProperty("filter[ids][0]");
+  });
+
+  it("maps internal order ID batches to indexed flat query keys", async () => {
+    const bridge = mockBridge([{ success: true, orders: [], pagination: { totalCount: 0 } }]);
+    await handleListOrders({ filter_ids: [7141, 7142], raw: true, page: 1, limit: 100 });
+    expect(bridge.first()?.params).toMatchObject({
+      "filter[ids][0]": "7141", "filter[ids][1]": "7142", page: "1", limit: "100",
+    });
+    expect(bridge.first()?.params).not.toHaveProperty("filter[ids][]");
+  });
+
+  it("accepts only documented page sizes", () => {
+    for (const limit of [20, 50, 100]) {
+      expect(listOrdersSchema.safeParse({ limit }).success).toBe(true);
+    }
+    for (const limit of [1, 10, 101]) {
+      expect(listOrdersSchema.safeParse({ limit }).success).toBe(false);
+    }
+    expect(listOrdersSchema.parse({}).limit).toBe(20);
+  });
+
+  it("bounds optional internal-ID batches to 1–100 positive integers", () => {
+    expect(listOrdersSchema.safeParse({ filter_ids: [1] }).success).toBe(true);
+    expect(listOrdersSchema.safeParse({ filter_ids: Array(100).fill(1) }).success).toBe(true);
+    expect(listOrdersSchema.safeParse({ filter_ids: [] }).success).toBe(false);
+    expect(listOrdersSchema.safeParse({ filter_ids: [0] }).success).toBe(false);
+    expect(listOrdersSchema.safeParse({ filter_ids: [1.5] }).success).toBe(false);
+    expect(listOrdersSchema.safeParse({ filter_ids: Array(101).fill(1) }).success).toBe(false);
   });
 
   it("returns a shaped summary with pagination", async () => {
@@ -54,10 +85,12 @@ describe("handleListOrders", () => {
 describe("handleGetOrder", () => {
   it("fetches and shapes an order by id", async () => {
     const bridge = mockBridge([{ success: true, order: { id: 42, number: "42", status: "new" } }]);
-    const result = await handleGetOrder({ id: "42", by: "id", detail: "summary" });
+    const input = getOrderSchema.parse({ id: "42", detail: "summary" });
+    const result = await handleGetOrder(input);
     const req = bridge.first();
     expect(req.op).toBe("get");
     expect(req.path).toBe("/orders/42");
+    expect(req.params).toEqual({ by: "id" });
     expect(JSON.parse(result.text).order.id).toBe(42);
   });
 

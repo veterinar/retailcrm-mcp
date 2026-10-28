@@ -10,7 +10,7 @@ import type { RawOrder } from "../types.js";
 export const getOrdersSummarySchema = z.object({
   date_from: dateField("Start date for the summary period (YYYY-MM-DD)"),
   date_to: dateField("End date for the summary period (YYYY-MM-DD)"),
-  filter_status: z.string().optional().describe("Restrict the summary to a single status code"),
+  filter_status: z.string().optional().describe("Restrict the summary to one status or status-group code; sent as the API's extendedStatus array filter"),
   max_pages: z.number().int().min(1).max(20).default(5)
     .describe("Pages of 100 orders to aggregate (revenue/status are computed over this window; the count is always exact)"),
 });
@@ -28,7 +28,7 @@ export async function handleGetOrdersSummary(params: z.infer<typeof getOrdersSum
         limit: "100",
         page: String(page),
       };
-      if (params.filter_status) query["filter[status]"] = params.filter_status;
+      if (params.filter_status) query["filter[extendedStatus][]"] = params.filter_status;
 
       const resp = await retailCrmGet("/orders", query) as {
         orders?: RawOrder[];
@@ -74,7 +74,7 @@ export async function handleGetCustomersSummary(params: z.infer<typeof getCustom
     const resp = await retailCrmGet("/customers", {
       "filter[dateFrom]": params.date_from,
       "filter[dateTo]": params.date_to,
-      limit: "1",
+      limit: "20",
     }) as { pagination?: { totalCount?: number } };
 
     return ok({

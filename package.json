@@ -1,7 +1,7 @@
 {
   "name": "retailcrm-mcp",
-  "version": "3.2.0",
-  "description": "MCP server for RetailCRM — 44 tools for orders, customers, inventory, payments, tasks & e-commerce analytics, transported via the official retailcrm/api-client-php 6.15.32 through a PHP bridge",
+  "version": "3.2.3",
+  "description": "MCP server for RetailCRM — 45 tools for orders, customers, inventory, payments, tasks & e-commerce analytics, transported via the official retailcrm/api-client-php 6.15.32 through a PHP bridge",
   "type": "module",
   "private": true,
   "main": "dist/index.js",

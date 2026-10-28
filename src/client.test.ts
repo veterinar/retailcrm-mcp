@@ -17,14 +17,14 @@ describe("retailCrmGet (PHP bridge transport)", () => {
   it("sends op:get with the route and flat params to the bridge (no leading slash)", async () => {
     const bridge = mockBridge([{ success: true, orders: [] }]);
 
-    const result = await retailCrmGet("/orders", { "filter[status]": "new", limit: "20" });
+    const result = await retailCrmGet("/orders", { "filter[extendedStatus][]": "new", limit: "20" });
 
     expect(result).toEqual({ success: true, orders: [] });
     const req = bridge.first();
     expect(req.v).toBe(1);
     expect(req.op).toBe("get");
     expect(req.path).toBe("/orders"); // bridge strips the leading slash itself
-    expect(req.params).toEqual({ "filter[status]": "new", limit: "20" });
+    expect(req.params).toEqual({ "filter[extendedStatus][]": "new", limit: "20" });
     // Credentials must NOT travel in the bridge request payload
     expect(JSON.stringify(req)).not.toContain("test-api-key-123");
   });

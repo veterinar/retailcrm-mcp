@@ -39,7 +39,63 @@ describe("analytics-sxo join key", () => {
     expect(a.order.join_key).toBe(b.order.join_key);
     // The digest is opaque hex and no join-key metadata field carries the raw basis
     expect(a.order.join_key).toMatch(/^[0-9a-f]{64}$/);
-    expect(Object.keys(a.order).filter(k => k.includes("join"))).toEqual(["join_key"]);
+    expect(Object.keys(a.order).filter(k => k.includes("join")).sort()).toEqual([
+      "customer_join_key", "customer_join_key_reason", "join_key",
+    ]);
+    expect(a.order.customer_join_key).toBeNull();
+    expect(a.order.customer_join_key_reason).toBe("missing_customer_id");
+  });
+
+  it("builds a site-independent customer key only from positive safe integer customer.id", () => {
+    const project = (raw: unknown) => {
+      const result = projectOrder(raw as Parameters<typeof projectOrder>[0], CTX);
+      if ("error" in result) throw new Error("projection failed");
+      return result.order;
+    };
+    const first = project({ id: 7, externalId: "ORDER-7", site: "site-a", customer: { id: 42 } });
+    const sameCustomerOtherSite = project({ id: 8, externalId: "ORDER-8", site: "site-b", customer: { id: 42 } });
+    const otherCustomer = project({ id: 9, externalId: "ORDER-9", site: "site-a", customer: { id: 43 } });
+    const expectedCustomerKey = createHmac("sha256", SECRET).update("petdog-customer-v1:42").digest("hex");
+
+    expect(first.customer_join_key).toBe(expectedCustomerKey);
+    expect(first.customer_join_key_reason).toBeNull();
+    expect(sameCustomerOtherSite.customer_join_key).toBe(expectedCustomerKey);
+    expect(otherCustomer.customer_join_key).not.toBe(expectedCustomerKey);
+    expect(first.customer_join_key).not.toBe(first.join_key);
+    expect(first.join_key).not.toBe(sameCustomerOtherSite.join_key);
+    expect(first).not.toHaveProperty("customer");
+  });
+
+  it("keeps orders when customer.id is missing or invalid and never falls back to contact identifiers", () => {
+    const project = (customer: unknown) => {
+      const result = projectOrder({
+        id: 7,
+        externalId: "ORDER-7",
+        clientId: "native-client-42",
+        email: "synthetic@example.invalid",
+        phone: "+10000000000",
+        customer,
+      } as unknown as Parameters<typeof projectOrder>[0], CTX);
+      if ("error" in result) throw new Error("projection failed");
+      return result.order;
+    };
+    const expectedOrderKey = createHmac("sha256", SECRET).update("petdog-order-v1:ORDER-7").digest("hex");
+
+    for (const customer of [undefined, null, {}, { id: null }]) {
+      const order = project(customer);
+      expect(order.customer_join_key).toBeNull();
+      expect(order.customer_join_key_reason).toBe("missing_customer_id");
+      expect(order.join_key).toBe(expectedOrderKey);
+    }
+    for (const customer of [
+      { id: "42" }, { id: 0 }, { id: -1 }, { id: 1.5 },
+      { id: Number.MAX_SAFE_INTEGER + 1 }, { id: true }, "42", [],
+    ]) {
+      const order = project(customer);
+      expect(order.customer_join_key).toBeNull();
+      expect(order.customer_join_key_reason).toBe("invalid_customer_id");
+      expect(order.join_key).toBe(expectedOrderKey);
+    }
   });
 
   it("refuses a missing or weak (<32 chars) secret before any bridge call", async () => {
@@ -91,6 +147,9 @@ describe("analytics-sxo projection", () => {
     const parsed = JSON.parse(text);
     expect(parsed.orders[0].retailcrm_client_id).toBe("native-cid-1");
     expect(parsed.orders[0].retailcrm_client_id_source).toBe("retailcrm_native_clientId");
+    expect(parsed.orders[0].customer_join_key).toBe(createHmac("sha256", SECRET).update("petdog-customer-v1:9").digest("hex"));
+    expect(parsed.orders[0].customer_join_key_reason).toBeNull();
+    expect(parsed.orders[0]).not.toHaveProperty("customer");
     expect(parsed.complete).toBe(true);
     expect(parsed.count).toBe(1);
     expect(parsed.orders[0].attribution.client_id).toMatchObject({ value: "12345", field_code: "metrika_cid", source: "configured_custom_field" });
@@ -414,6 +473,7 @@ describe("analytics-sxo attribution and channels", () => {
     });
     const r = await handleOrderAttribution({ id: "501", by: "id" });
     expect(r.isError).toBeFalsy();
+    expect(bridge.calls.find(req => req.path === "/orders/501")?.params).toEqual({ by: "id" });
     const parsed = JSON.parse(r.text);
     expect(parsed.attribution_configured_keys).toEqual(["client_id", "yclid"]);
     expect(parsed.order.attribution.client_id.value).toBe("12345");

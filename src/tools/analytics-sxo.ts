@@ -12,6 +12,7 @@ import { dateField } from "./common.js";
 
 const HMAC_ENV = "RETAILCRM_ANALYTICS_HMAC_SECRET";
 const JOIN_KEY_PREFIX = "petdog-order-v1:";
+const CUSTOMER_JOIN_KEY_PREFIX = "petdog-customer-v1:";
 const MIN_SECRET_LEN = 32;
 
 // ── Raw provider shapes (only what this surface reads) ───────
@@ -48,6 +49,7 @@ interface AsxOrderRaw {
   totalSumm?: number;
   currency?: string;
   clientId?: string;
+  customer?: { id?: number | null } | null;
   fullPaidAt?: string;
   source?: { source?: string; medium?: string; campaign?: string } | string | null;
   customFields?: Record<string, unknown> | null;
@@ -717,6 +719,8 @@ export type AnalyticsOrder = {
   // from totalSumm, netCost, delivery type or any default.
   delivery_income_rub: number | null;
   join_key: string | null;
+  customer_join_key: string | null;
+  customer_join_key_reason: "missing_customer_id" | "invalid_customer_id" | null;
 };
 
 // statusGroups is optional for legacy direct projectOrder callers: an absent
@@ -898,6 +902,21 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
   // customer-paid delivery.cost ONLY when the safe delivery projection above
   // accepted a finite non-negative number — never totalSumm/netCost/type/default.
   const paymentProvider = classifyPaymentProvider(o.payments, ctx.paidStatusCodes, ctx.providerMap ?? { configured: false });
+  const rawCustomer = o.customer as unknown;
+  const customer = rawCustomer !== null && typeof rawCustomer === "object" && !Array.isArray(rawCustomer)
+    ? rawCustomer as { id?: unknown }
+    : null;
+  const customerId = customer?.id;
+  const canonicalCustomerId = typeof customerId === "number" && Number.isSafeInteger(customerId) && customerId > 0
+    ? customerId
+    : null;
+  const customerJoinKeyReason = rawCustomer === undefined || rawCustomer === null ||
+    (customer !== null && (customerId === undefined || customerId === null))
+    ? "missing_customer_id"
+    : canonicalCustomerId === null ? "invalid_customer_id" : null;
+  const customerJoinKey = canonicalCustomerId === null
+    ? null
+    : createHmac("sha256", ctx.secret).update(CUSTOMER_JOIN_KEY_PREFIX + String(canonicalCustomerId)).digest("hex");
   return {
     order: {
       id: o.id,
@@ -927,6 +946,8 @@ export function projectOrder(o: AsxOrderRaw, ctx: ProjectionCtx): { order: Analy
       sber_paid_amount_rub: paymentProvider === "SBER" ? crmPaidAmount : null,
       delivery_income_rub: delivery !== null ? delivery.cost : null,
       join_key: orderJoinKey(o, ctx.secret),
+      customer_join_key: customerJoinKey,
+      customer_join_key_reason: customerJoinKeyReason,
     },
     // Internal paid pair: ONLY crm_fully_paid (order.fullPaidAt) — never a
     // payment status, order status or payment timestamp.
@@ -1271,7 +1292,7 @@ export async function handleOrderAttribution(params: z.infer<typeof orderAttribu
     const guard = guardConfig();
     if ("error" in guard) return fail(guard.error);
     const paidStatusCodes = await fetchPaidStatusCodes();
-    const query: Record<string, string> = params.by === "externalId" ? { by: "externalId" } : {};
+    const query: Record<string, string> = { by: params.by };
     const resp = (await retailCrmGet(`/orders/${encodeURIComponent(params.id)}`, query)) as { order?: unknown; generatedAt?: unknown };
     const raw = resp?.order;
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
