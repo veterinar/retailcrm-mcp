@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   handleListCustomers, handleGetCustomer, handleCreateCustomer,
-  handleUpdateCustomer, handleMergeCustomers,
+  handleUpdateCustomer, handleMergeCustomers, getCustomerSchema, listCustomersSchema,
 } from "./customers.js";
 import { mockBridge } from "../../tests/bridge-mock.js";
 
@@ -21,13 +21,23 @@ describe("handleListCustomers", () => {
       customers: [{ id: 5, firstName: "Ivan", lastName: "Petrov", email: "i@mail.ru", ordersCount: 3, totalSumm: 9000 }],
       pagination: { currentPage: 1, totalPageCount: 1, totalCount: 1 },
     }]);
-    const result = await handleListCustomers({ filter_email: "test@mail.ru", detail: "summary", page: 1, limit: 10 });
+    const result = await handleListCustomers({ filter_email: "test@mail.ru", detail: "summary", page: 1, limit: 20 });
     const req = bridge.first();
     expect(req.op).toBe("get");
     expect(req.path).toBe("/customers");
-    expect(req.params).toMatchObject({ "filter[email]": "test@mail.ru" });
+    expect(req.params).toMatchObject({ "filter[email]": "test@mail.ru", limit: "20" });
     const parsed = JSON.parse(result.text);
     expect(parsed.customers[0]).toMatchObject({ id: 5, name: "Ivan Petrov", ordersCount: 3, totalSpent: 9000 });
+  });
+
+  it("accepts only documented page sizes", () => {
+    for (const limit of [20, 50, 100]) {
+      expect(listCustomersSchema.safeParse({ limit }).success).toBe(true);
+    }
+    for (const limit of [1, 10, 101]) {
+      expect(listCustomersSchema.safeParse({ limit }).success).toBe(false);
+    }
+    expect(listCustomersSchema.parse({}).limit).toBe(20);
   });
 
   it("uses the customers-endpoint date filter keys (dateFrom/dateTo, not createdAt*)", async () => {
@@ -45,10 +55,20 @@ describe("handleListCustomers", () => {
 describe("handleGetCustomer", () => {
   it("fetches and shapes a customer by id", async () => {
     const bridge = mockBridge([{ success: true, customer: { id: 5, firstName: "Ivan" } }]);
-    const result = await handleGetCustomer({ id: "5", by: "id", detail: "summary" });
+    const input = getCustomerSchema.parse({ id: "5", detail: "summary" });
+    const result = await handleGetCustomer(input);
     const req = bridge.first();
     expect(req.path).toBe("/customers/5");
+    expect(req.params).toEqual({ by: "id" });
     expect(JSON.parse(result.text).customer.name).toBe("Ivan");
+  });
+
+  it("passes externalId through explicitly", async () => {
+    const bridge = mockBridge([{ success: true, customer: { id: 5 } }]);
+    await handleGetCustomer({ id: "EXT-5", by: "externalId", detail: "summary" });
+    const req = bridge.first();
+    expect(req.path).toBe("/customers/EXT-5");
+    expect(req.params).toEqual({ by: "externalId" });
   });
 });
 

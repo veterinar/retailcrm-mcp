@@ -78,8 +78,14 @@ function failInternal(string $message): void {
 register_shutdown_function(static function (): void {
     $last = error_get_last();
     if ($last !== null && in_array($last['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
-        failInternal('bridge fatal error');
+        fail(0, sprintf('bridge fatal %d at %s:%d', $last['type'], basename($last['file']), $last['line']));
     }
+});
+
+// SDK failures outside ApiExceptionInterface must not escape as an opaque fatal;
+// class/location are diagnostic, while exception messages may contain request data.
+set_exception_handler(static function (\Throwable $error): void {
+    fail(0, sprintf('bridge exception %s at %s:%d', get_class($error), basename($error->getFile()), $error->getLine()));
 });
 
 /**
@@ -193,14 +199,12 @@ function officialRequest(string $op, string $route, array $params): array {
     try {
         $data = $client->customMethods->call('mcp', $params);
     } catch (\RetailCrm\Api\Interfaces\ApiExceptionInterface $e) {
-        $errorResponse = $e->getErrorResponse();
         fail(
             $e->getStatusCode(),
             (string) json_encode(
                 [
                     'success'  => false,
-                    'errorMsg' => $errorResponse->errorMsg ?? $e->getMessage(),
-                    'errors'   => $errorResponse->errors ?? [],
+                    'errorMsg' => 'RetailCRM rejected the request',
                 ],
                 JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
             )

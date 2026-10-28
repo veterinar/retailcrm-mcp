@@ -16,5 +16,5 @@ export const siteField = z.string().optional()
 
 export const pageField = z.number().int().min(1).default(1).describe("Page number");
 
-export const limitField = z.number().int().min(1).max(100).default(20)
-  .describe("Results per page (max 100)");
+export const limitField = z.union([z.literal(20), z.literal(50), z.literal(100)]).default(20)
+  .describe("Results per page. RetailCRM supports 20, 50, or 100 (default 20).");

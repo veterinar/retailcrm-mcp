@@ -42,8 +42,7 @@ export const getCustomerSchema = z.object({
 
 export async function handleGetCustomer(params: z.infer<typeof getCustomerSchema>): Promise<ToolResult> {
   return runTool(async () => {
-    const query: Record<string, string> = {};
-    if (params.by === "externalId") query["by"] = "externalId";
+    const query: Record<string, string> = { by: params.by };
     const result = await retailCrmGet(`/customers/${encodeURIComponent(params.id)}`, query) as { customer?: RawCustomer };
     if (params.raw || !result?.customer) return ok(result);
     const view = params.detail === "full" ? toCustomerView(result.customer) : toCustomerSummary(result.customer);

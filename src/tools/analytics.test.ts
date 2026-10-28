@@ -55,6 +55,14 @@ describe("handleGetOrdersSummary", () => {
     expect(parsed.aggregatedOver).toBe(1);
     expect(parsed.partial).toBe(true);
   });
+
+  it("sends the status through RetailCRM's extendedStatus array filter", async () => {
+    const bridge = mockBridge([{ success: true, orders: [], pagination: { currentPage: 1, totalPageCount: 1, totalCount: 0 } }]);
+    await handleGetOrdersSummary({ date_from: "2025-01-01", date_to: "2025-01-31", filter_status: "complete", max_pages: 1 });
+    const req = bridge.first();
+    expect(req.params).toMatchObject({ "filter[extendedStatus][]": "complete" });
+    expect(req.params).not.toHaveProperty("filter[status]");
+  });
 });
 
 describe("handleGetCustomersSummary", () => {
@@ -65,6 +73,7 @@ describe("handleGetCustomersSummary", () => {
     expect(req.params).toMatchObject({
       "filter[dateFrom]": "2025-01-01", // not createdAtFrom (that's orders-only)
       "filter[dateTo]": "2025-01-31",
+      limit: "20",
     });
     expect(JSON.parse(result.text)).toMatchObject({ newCustomers: 42 });
   });
