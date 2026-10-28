@@ -7,6 +7,8 @@ import type { RawOrder } from "../types.js";
 
 // ── list_orders ──────────────────────────────────────────────
 export const listOrdersSchema = z.object({
+  filter_ids: z.array(z.number().int().positive()).min(1).max(100).optional()
+    .describe("Restrict the list to these internal RetailCRM order IDs (at most 100 IDs per MCP call)"),
   filter_status: z.string().optional().describe("Filter by one status or status-group code from list_statuses; sent as the API's extendedStatus array filter."),
   filter_customer: z.string().optional().describe("Filter by customer name (partial match)"),
   filter_number: z.string().optional().describe("Filter by order number"),
@@ -21,6 +23,7 @@ export const listOrdersSchema = z.object({
 export async function handleListOrders(params: z.infer<typeof listOrdersSchema>): Promise<ToolResult> {
   return runTool(async () => {
     const query: Record<string, string> = { page: String(params.page), limit: String(params.limit) };
+    params.filter_ids?.forEach((id, index) => { query[`filter[ids][${index}]`] = String(id); });
     if (params.filter_status) query["filter[extendedStatus][]"] = params.filter_status;
     if (params.filter_customer) query["filter[customer]"] = params.filter_customer;
     if (params.filter_number) query["filter[number]"] = params.filter_number;

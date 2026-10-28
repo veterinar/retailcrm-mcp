@@ -48,7 +48,7 @@ const def = (name: string, title: string, access: Access, schema: z.ZodObject<z.
 const TOOLS: ToolDef[] = [
   // ── Orders ──
   def("list_orders", "List Orders", "read", orders.listOrdersSchema, orders.handleListOrders,
-    "List orders with optional status code or status-group token, customer name, number, and created-date range. RetailCRM v5 accepts limit 20, 50, or 100 (default 20); status filtering uses filter[extendedStatus][] with a status symbol code or token ending in -group. Returns (summary): pagination + array of {id, number, status, total, customer, phone, itemCount, createdAt}. Use detail:'full' for line items/delivery/payments, raw:true for the untouched payload."),
+    "List orders with optional internal filter_ids (up to 100 per MCP call), status code or status-group token, customer name, number, and created-date range. RetailCRM v5 accepts limit 20, 50, or 100 (default 20); status filtering uses filter[extendedStatus][] with a status symbol code or token ending in -group. Returns (summary): pagination + array of {id, number, status, total, customer, phone, itemCount, createdAt}. Use detail:'full' for line items/delivery/payments, raw:true for the untouched payload."),
   def("get_order", "Get Order", "read", orders.getOrderSchema, orders.handleGetOrder,
     "Get one order by internal RetailCRM ID (default; sends by=id) or externalId (by=externalId). Returns a shaped order; detail:'full' adds items, delivery, payments, comments."),
   def("create_order", "Create Order", "write", orders.createOrderSchema, orders.handleCreateOrder,
@@ -60,7 +60,7 @@ const TOOLS: ToolDef[] = [
 
   // ── Customers ──
   def("list_customers", "List Customers", "read", customers.listCustomersSchema, customers.handleListCustomers,
-    "List/search customers by name, email, phone, created-date. RetailCRM v5 accepts limit 20, 50, or 100 (default 20). Returns (summary): pagination + array of {id, name, email, phone, ordersCount, totalSpent}. detail:'full' adds address/externalId/all phones."),
+    "List/search customers by internal filter_ids (up to 100 per MCP call), name, email, phone, or created-date. RetailCRM v5 accepts limit 20, 50, or 100 (default 20). Returns (summary): pagination + array of {id, name, email, phone, ordersCount, totalSpent}. detail:'full' adds address/externalId/all phones."),
   def("get_customer", "Get Customer", "read", customers.getCustomerSchema, customers.handleGetCustomer,
     "Get one customer by internal RetailCRM ID (default; sends by=id) or externalId (by=externalId). Returns a shaped customer; detail:'full' adds address and contact details."),
   def("get_customer_field_definitions", "Get Customer Field Definitions", "read", customers.getCustomerFieldDefinitionsSchema, customers.handleGetCustomerFieldDefinitions,

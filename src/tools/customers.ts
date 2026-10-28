@@ -6,6 +6,8 @@ import type { RawCustomer } from "../types.js";
 
 // ── list_customers ───────────────────────────────────────────
 export const listCustomersSchema = z.object({
+  filter_ids: z.array(z.number().int().positive()).min(1).max(100).optional()
+    .describe("Restrict the list to these internal RetailCRM customer IDs (at most 100 IDs per MCP call)"),
   filter_name: z.string().optional().describe("Filter by customer name (partial match)"),
   filter_email: z.string().optional().describe("Filter by email address"),
   filter_phone: z.string().optional().describe("Filter by phone number"),
@@ -20,6 +22,7 @@ export const listCustomersSchema = z.object({
 export async function handleListCustomers(params: z.infer<typeof listCustomersSchema>): Promise<ToolResult> {
   return runTool(async () => {
     const query: Record<string, string> = { page: String(params.page), limit: String(params.limit) };
+    params.filter_ids?.forEach((id, index) => { query[`filter[ids][${index}]`] = String(id); });
     if (params.filter_name) query["filter[name]"] = params.filter_name;
     if (params.filter_email) query["filter[email]"] = params.filter_email;
     if (params.filter_phone) query["filter[phone]"] = params.filter_phone;

@@ -21,9 +21,20 @@ describe("handleListOrders", () => {
     expect(req.params).toMatchObject({
       "filter[extendedStatus][]": "complete",
       "filter[createdAtFrom]": "2025-01-01",
+      page: "1",
       limit: "20",
     });
     expect(req.params).not.toHaveProperty("filter[status]");
+    expect(req.params).not.toHaveProperty("filter[ids][0]");
+  });
+
+  it("maps internal order ID batches to indexed flat query keys", async () => {
+    const bridge = mockBridge([{ success: true, orders: [], pagination: { totalCount: 0 } }]);
+    await handleListOrders({ filter_ids: [7141, 7142], raw: true, page: 1, limit: 100 });
+    expect(bridge.first()?.params).toMatchObject({
+      "filter[ids][0]": "7141", "filter[ids][1]": "7142", page: "1", limit: "100",
+    });
+    expect(bridge.first()?.params).not.toHaveProperty("filter[ids][]");
   });
 
   it("accepts only documented page sizes", () => {
@@ -34,6 +45,15 @@ describe("handleListOrders", () => {
       expect(listOrdersSchema.safeParse({ limit }).success).toBe(false);
     }
     expect(listOrdersSchema.parse({}).limit).toBe(20);
+  });
+
+  it("bounds optional internal-ID batches to 1–100 positive integers", () => {
+    expect(listOrdersSchema.safeParse({ filter_ids: [1] }).success).toBe(true);
+    expect(listOrdersSchema.safeParse({ filter_ids: Array(100).fill(1) }).success).toBe(true);
+    expect(listOrdersSchema.safeParse({ filter_ids: [] }).success).toBe(false);
+    expect(listOrdersSchema.safeParse({ filter_ids: [0] }).success).toBe(false);
+    expect(listOrdersSchema.safeParse({ filter_ids: [1.5] }).success).toBe(false);
+    expect(listOrdersSchema.safeParse({ filter_ids: Array(101).fill(1) }).success).toBe(false);
   });
 
   it("returns a shaped summary with pagination", async () => {

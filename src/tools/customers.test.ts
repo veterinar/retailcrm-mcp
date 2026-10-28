@@ -28,6 +28,8 @@ describe("handleListCustomers", () => {
     expect(req.op).toBe("get");
     expect(req.path).toBe("/customers");
     expect(req.params).toMatchObject({ "filter[email]": "test@mail.ru", limit: "20" });
+    expect(req.params).toMatchObject({ page: "1" });
+    expect(req.params).not.toHaveProperty("filter[ids][0]");
     const parsed = JSON.parse(result.text);
     expect(parsed.customers[0]).toMatchObject({ id: 5, name: "Ivan Petrov", ordersCount: 3, totalSpent: 9000 });
   });
@@ -40,6 +42,24 @@ describe("handleListCustomers", () => {
       expect(listCustomersSchema.safeParse({ limit }).success).toBe(false);
     }
     expect(listCustomersSchema.parse({}).limit).toBe(20);
+  });
+
+  it("maps internal customer ID batches to indexed flat query keys", async () => {
+    const bridge = mockBridge([{ success: true, customers: [], pagination: { totalCount: 0 } }]);
+    await handleListCustomers({ filter_ids: [11, 12], raw: true, page: 1, limit: 100 });
+    expect(bridge.first()?.params).toMatchObject({
+      "filter[ids][0]": "11", "filter[ids][1]": "12", page: "1", limit: "100",
+    });
+    expect(bridge.first()?.params).not.toHaveProperty("filter[ids][]");
+  });
+
+  it("bounds optional internal-ID batches to 1–100 positive integers", () => {
+    expect(listCustomersSchema.safeParse({ filter_ids: [1] }).success).toBe(true);
+    expect(listCustomersSchema.safeParse({ filter_ids: Array(100).fill(1) }).success).toBe(true);
+    expect(listCustomersSchema.safeParse({ filter_ids: [] }).success).toBe(false);
+    expect(listCustomersSchema.safeParse({ filter_ids: [0] }).success).toBe(false);
+    expect(listCustomersSchema.safeParse({ filter_ids: [1.5] }).success).toBe(false);
+    expect(listCustomersSchema.safeParse({ filter_ids: Array(101).fill(1) }).success).toBe(false);
   });
 
   it("uses the customers-endpoint date filter keys (dateFrom/dateTo, not createdAt*)", async () => {

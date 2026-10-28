@@ -25,7 +25,7 @@ Read tools return a **compact, shaped summary** of only the fields an agent need
 ### Orders
 | Tool | Description |
 |------|-------------|
-| `list_orders` | List orders by status, customer, number, date range; v5 limit 20/50/100 (default 20) |
+| `list_orders` | List by internal `filter_ids` (MCP cap 100 per call), status, customer, number, date; v5 limit 20/50/100 |
 | `get_order` | Get one order by internal ID (`by=id`, default) or externalId (`by=externalId`) |
 | `create_order` | Create an order; link an existing customer (`customer_id`/`customer_external_id`) or create one inline |
 | `update_order` | Update status, customer, delivery, comments |
@@ -34,7 +34,7 @@ Read tools return a **compact, shaped summary** of only the fields an agent need
 ### Customers
 | Tool | Description |
 |------|-------------|
-| `list_customers` | Search customers by name, email, phone, date; v5 limit 20/50/100 (default 20) |
+| `list_customers` | Search by internal `filter_ids` (MCP cap 100 per call), name, email, phone, date; v5 limit 20/50/100 |
 | `get_customer` | Get one customer by internal ID (`by=id`, default) or externalId (`by=externalId`) |
 | `get_customer_field_definitions` | Look up selected customer custom-field definitions by code; returns metadata only, never values |
 | `create_customer` | Create a customer |
